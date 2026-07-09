@@ -8,6 +8,7 @@
 ![Dashboard](https://img.shields.io/badge/Dashboard-Vanilla%20JS%20%7C%20Canvas-purple)
 
 ---
+<img width="1829" height="956" alt="image" src="https://github.com/user-attachments/assets/76f5b077-2ed1-4ab9-946c-3d9330a43621" />
 
 ## What is CleanCrop?
 
