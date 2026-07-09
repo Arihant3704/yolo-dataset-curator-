@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# PyTorch / HuggingFace model caches
+*.pt
+*.pth
+*.bin
+*.safetensors
+.cache/
+
+# Dataset files — do NOT commit raw datasets
+auto/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.mp4
+*.avi
+
+# Generated output directories
+road_traffic_curated/
+*_curated/
+demo_dataset/
+
+# Large archive files
+*.zip
+*.tar.gz
+*.tar.bz2
+*.7z
+
+# Reports — too large for git
+curation_report.csv
+curation_actions.txt
+
+# PDF / book assets
+*.pdf
+hanuman_backup/
+images/
+little_hanuman_book.pdf
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log

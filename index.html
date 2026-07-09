@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CleanCrop - Dataset Quality & Curation Dashboard</title>
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="sidebar-brand">
+                <i class="fa-solid fa-wand-magic-sparkles brand-icon"></i>
+                <div class="brand-text">
+                    <h1>CleanCrop</h1>
+                    <span>Dataset Quality Curator</span>
+                </div>
+            </div>
+            
+            <nav class="sidebar-menu">
+                <button class="menu-item active" data-tab="overview">
+                    <i class="fa-solid fa-chart-pie"></i> <span>Overview</span>
+                </button>
+                <button class="menu-item" data-tab="duplicates">
+                    <i class="fa-solid fa-copy"></i> 
+                    <span>Near-Duplicates</span>
+                    <span class="badge badge-dup" id="badge-dup-count">0</span>
+                </button>
+                <button class="menu-item" data-tab="outliers">
+                    <i class="fa-solid fa-triangle-exclamation"></i> 
+                    <span>Outliers</span>
+                    <span class="badge badge-out" id="badge-out-count">0</span>
+                </button>
+                <button class="menu-item" data-tab="mislabels">
+                    <i class="fa-solid fa-tag"></i> 
+                    <span>Likely-Mislabels</span>
+                    <span class="badge badge-mis" id="badge-mis-count">0</span>
+                </button>
+                <button class="menu-item" data-tab="explorer">
+                    <i class="fa-solid fa-magnifying-glass"></i> <span>Data Explorer</span>
+                </button>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="upload-section">
+                    <label for="json-upload" class="upload-btn">
+                        <i class="fa-solid fa-cloud-arrow-up"></i> Upload Curation Report
+                    </label>
+                    <input type="file" id="json-upload" accept=".json" style="display: none;">
+                </div>
+                <div class="demo-info">
+                    <i class="fa-solid fa-circle-info"></i>
+                    <span>Running in Curation Mode (Road Traffic)</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Top Navbar / Dynamic Tuner -->
+            <header class="top-nav">
+                <div class="nav-title">
+                    <h2 id="current-tab-title">Overview Dashboard</h2>
+                    <p id="current-tab-desc">High-level insights and statistics on dataset health.</p>
+                </div>
+                
+                <!-- Real-time Threshold Tuning Controls -->
+                <div class="tuner-panel">
+                    <div class="tuner-header">
+                        <i class="fa-solid fa-sliders"></i> Real-time Algorithmic Tuner
+                    </div>
+                    <div class="tuner-controls">
+                        <!-- Duplicate Threshold -->
+                        <div class="control-group">
+                            <label for="slider-dup">
+                                <span>Duplicate Sim Threshold</span>
+                                <span class="slider-value" id="val-dup">0.95</span>
+                            </label>
+                            <input type="range" id="slider-dup" min="0.80" max="1.00" step="0.01" value="0.95">
+                        </div>
+                        
+                        <!-- Outlier Centroid Threshold -->
+                        <div class="control-group">
+                            <label for="slider-out-centroid">
+                                <span>Outlier Centroid Sim</span>
+                                <span class="slider-value" id="val-out-centroid">0.85</span>
+                            </label>
+                            <input type="range" id="slider-out-centroid" min="0.50" max="0.99" step="0.01" value="0.85">
+                        </div>
+                        
+                        <!-- Mislabel K Neighbors -->
+                        <div class="control-group">
+                            <label for="slider-mis-k">
+                                <span>KNN Neighborhood Size (k)</span>
+                                <span class="slider-value" id="val-mis-k">5</span>
+                            </label>
+                            <input type="range" id="slider-mis-k" min="3" max="15" step="1" value="5">
+                        </div>
+
+                        <!-- Mislabel Consensus -->
+                        <div class="control-group">
+                            <label for="slider-mis-consensus">
+                                <span>Mislabel Ratio Threshold</span>
+                                <span class="slider-value" id="val-mis-consensus">0.50</span>
+                            </label>
+                            <input type="range" id="slider-mis-consensus" min="0.20" max="0.80" step="0.05" value="0.50">
+                        </div>
+                    </div>
+                </div>
+            </header>
+
+            <div class="content-scroll">
+                
+                <!-- TAB 1: OVERVIEW -->
+                <section class="tab-pane active" id="tab-overview">
+                    <!-- Stats Grid -->
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-icon-wrapper clean">
+                                <i class="fa-solid fa-shield-halved"></i>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-label">Dataset Health Score</span>
+                                <h3 class="stat-value" id="stat-health-score">82.0%</h3>
+                            </div>
+                        </div>
+                        <div class="stat-card clickable" data-tab-link="duplicates">
+                            <div class="stat-icon-wrapper duplicate">
+                                <i class="fa-solid fa-copy"></i>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-label">Duplicate Pairs</span>
+                                <h3 class="stat-value" id="stat-duplicate-count">6</h3>
+                            </div>
+                        </div>
+                        <div class="stat-card clickable" data-tab-link="outliers">
+                            <div class="stat-icon-wrapper outlier">
+                                <i class="fa-solid fa-triangle-exclamation"></i>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-label">Outlier Crops</span>
+                                <h3 class="stat-value" id="stat-outlier-count">13</h3>
+                            </div>
+                        </div>
+                        <div class="stat-card clickable" data-tab-link="mislabels">
+                            <div class="stat-icon-wrapper mislabel">
+                                <i class="fa-solid fa-tag"></i>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-label">Suspected Mislabels</span>
+                                <h3 class="stat-value" id="stat-mislabel-count">9</h3>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Visualization Section -->
+                    <div class="viz-section">
+                        <!-- 2D/3D Embedding Space Projection -->
+                        <div class="card viz-card">
+                            <div class="card-header">
+                                <div class="card-title" id="plot-card-title">
+                                    <i class="fa-solid fa-circle-nodes"></i> Interactive Embedding Space (PCA Projection)
+                                </div>
+                                <div class="legend" id="plot-legend">
+                                    <!-- Legend dynamically populated -->
+                                </div>
+                            </div>
+                            <div class="card-body plot-container">
+                                <canvas id="embedding-canvas"></canvas>
+                                <div class="plot-controls">
+                                    <button id="btn-plot-toggle-3d" title="Toggle 2D/3D Mode"><i class="fa-solid fa-cube"></i> 3D Mode</button>
+                                    <button id="btn-plot-reset" title="Reset View"><i class="fa-solid fa-arrows-rotate"></i></button>
+                                    <button id="btn-plot-toggle-flags" class="active" title="Toggle Anomaly Rings"><i class="fa-solid fa-eye"></i> Flags</button>
+                                </div>
+                                <div class="plot-instructions" id="plot-instructions">
+                                    <i class="fa-solid fa-arrows-up-down-left-right"></i> Drag to pan | <i class="fa-solid fa-magnifying-glass-plus"></i> Scroll to zoom | Click point to inspect
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Class Distribution & Cleanup Impact -->
+                        <div class="viz-sidebar">
+                            <div class="card">
+                                <div class="card-header">
+                                    <div class="card-title">
+                                        <i class="fa-solid fa-chart-column"></i> Class Distribution
+                                    </div>
+                                </div>
+                                <div class="card-body">
+                                    <div class="bar-chart-list" id="class-distribution-list">
+                                        <!-- Dynamically generated progress bars -->
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="card highlight-card">
+                                <div class="card-header">
+                                    <div class="card-title">
+                                        <i class="fa-solid fa-gauge-high"></i> Metric Inflation Risk
+                                    </div>
+                                </div>
+                                <div class="card-body text-center">
+                                    <div class="metric-meter">
+                                        <div class="meter-outer">
+                                            <div class="meter-inner" id="meter-fill"></div>
+                                            <div class="meter-label" id="meter-score">High</div>
+                                        </div>
+                                    </div>
+                                    <p class="meter-desc">
+                                        Near-duplicates act as data leakage if split between train/val. Removing them will stabilize your model metric credibility by preventing inflated scores.
+                                    </p>
+                                    <div class="curation-progress-bar">
+                                        <span>Curation Progress:</span>
+                                        <div class="p-bar-outer">
+                                            <div class="p-bar-inner" id="curation-progress" style="width: 0%;"></div>
+                                        </div>
+                                        <span id="curation-progress-text">0/28 resolved</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- TAB 2: NEAR-DUPLICATES -->
+                <section class="tab-pane" id="tab-duplicates">
+                    <div class="banner warning-banner">
+                        <i class="fa-solid fa-circle-exclamation"></i>
+                        <div>
+                            <strong>Metric Inflation Alert:</strong> Leaked near-duplicates trigger target representation leakage. Flagged pairs show similarity exceeding the threshold. Decide which crop to retain.
+                        </div>
+                    </div>
+
+                    <div class="curation-split-view">
+                        <!-- Duplicate Pairs List -->
+                        <div class="list-panel card">
+                            <div class="card-header">
+                                <div class="card-title" id="dup-pairs-title">Duplicate Pairs (0)</div>
+                            </div>
+                            <div class="card-body list-scroll scrollable" id="dup-list-container">
+                                <!-- Dynamically populated list of duplicate pairs -->
+                            </div>
+                        </div>
+
+                        <!-- Duplicate Inspection Detail -->
+                        <div class="inspector-panel card" id="dup-inspector">
+                            <div class="card-body empty-state-msg" id="dup-empty-state">
+                                <i class="fa-solid fa-copy"></i>
+                                <h3>Select a Duplicate Pair</h3>
+                                <p>Click on any pair in the list to compare them side-by-side and resolve the conflict.</p>
+                            </div>
+                            <div class="card-body inspector-content hidden" id="dup-inspector-content">
+                                <div class="similarity-pill-lg">
+                                    <span id="dup-similarity-value">98.5%</span> Similar
+                                </div>
+                                <div class="comparison-grid">
+                                    <!-- Card A -->
+                                    <div class="crop-compare-card" id="crop-card-a">
+                                        <div class="card-tag tag-a">Crop A</div>
+                                        <div class="crop-image-wrapper">
+                                            <img id="dup-img-a" src="" alt="Crop A">
+                                        </div>
+                                        <div class="crop-details">
+                                            <span class="crop-id" id="dup-id-a">crop_0023</span>
+                                            <span class="class-pill" id="dup-label-a">Apple</span>
+                                        </div>
+                                        <button class="btn btn-danger btn-block btn-delete-crop" data-target="a">
+                                            <i class="fa-solid fa-trash"></i> Retain Crop B & Delete A
+                                        </button>
+                                    </div>
+
+                                    <!-- Comparison Arrow -->
+                                    <div class="comparison-connector">
+                                        <i class="fa-solid fa-left-right"></i>
+                                    </div>
+
+                                    <!-- Card B -->
+                                    <div class="crop-compare-card" id="crop-card-b">
+                                        <div class="card-tag tag-b">Crop B</div>
+                                        <div class="crop-image-wrapper">
+                                            <img id="dup-img-b" src="" alt="Crop B">
+                                        </div>
+                                        <div class="crop-details">
+                                            <span class="crop-id" id="dup-id-b">crop_0084</span>
+                                            <span class="class-pill" id="dup-label-b">Apple</span>
+                                        </div>
+                                        <button class="btn btn-danger btn-block btn-delete-crop" data-target="b">
+                                            <i class="fa-solid fa-trash"></i> Retain Crop A & Delete B
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="inspector-actions">
+                                    <button class="btn btn-secondary" id="btn-dup-keep-both">
+                                        <i class="fa-solid fa-check-double"></i> Mark as False Positive (Keep Both)
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- TAB 3: OUTLIERS -->
+                <section class="tab-pane" id="tab-outliers">
+                    <div class="banner info-banner">
+                        <i class="fa-solid fa-circle-info"></i>
+                        <div>
+                            <strong>Outlier Detection:</strong> Flagged crops have low similarity to their class centroid or neighborhood. These are likely blurred boxes, mis-bounded crops, or junk images.
+                        </div>
+                    </div>
+
+                    <div class="filter-row">
+                        <div class="filter-info" id="outliers-stats">Showing 0 outliers</div>
+                        <div class="filter-actions">
+                            <button class="btn btn-secondary btn-small active" id="btn-outlier-filter-all">All Outliers</button>
+                            <button class="btn btn-secondary btn-small" id="btn-outlier-filter-centroid">Centroid Outliers</button>
+                            <button class="btn btn-secondary btn-small" id="btn-outlier-filter-knn">KNN Outliers</button>
+                        </div>
+                    </div>
+
+                    <div class="outlier-grid" id="outliers-grid-container">
+                        <!-- Dynamic list of outlier cards -->
+                    </div>
+                </section>
+
+                <!-- TAB 4: LIKELY-MISLABELS -->
+                <section class="tab-pane" id="tab-mislabels">
+                    <div class="banner error-banner">
+                        <i class="fa-solid fa-triangle-exclamation"></i>
+                        <div>
+                            <strong>Mislabel Detection:</strong> If a crop is closer in embedding space to crops of a DIFFERENT class, it is flagged as a suspected mislabel. Review neighbors and accept suggestions.
+                        </div>
+                    </div>
+
+                    <div class="curation-split-view">
+                        <!-- Mislabeled Items List -->
+                        <div class="list-panel card">
+                            <div class="card-header">
+                                <div class="card-title" id="mis-items-title">Suspected Wrong Labels (0)</div>
+                            </div>
+                            <div class="card-body list-scroll scrollable" id="mis-list-container">
+                                <!-- Dynamic list of mislabeled crops -->
+                            </div>
+                        </div>
+
+                        <!-- Mislabel Inspection Detail -->
+                        <div class="inspector-panel card" id="mis-inspector">
+                            <div class="card-body empty-state-msg" id="mis-empty-state">
+                                <i class="fa-solid fa-tag"></i>
+                                <h3>Select a Suspected Crop</h3>
+                                <p>Click on any item in the list to inspect its neighborhood and choose a resolution.</p>
+                            </div>
+                            <div class="card-body inspector-content hidden" id="mis-inspector-content">
+                                <div class="mislabel-flow">
+                                    <div class="flow-step current">
+                                        <span class="flow-label">Current Label</span>
+                                        <span class="class-pill class-pill-danger" id="mis-label-current">Orange</span>
+                                    </div>
+                                    <div class="flow-arrow">
+                                        <i class="fa-solid fa-arrow-right-long"></i>
+                                    </div>
+                                    <div class="flow-step suggestion">
+                                        <span class="flow-label">Suggested Label</span>
+                                        <span class="class-pill class-pill-success" id="mis-label-suggested">Apple</span>
+                                    </div>
+                                </div>
+
+                                <div class="mislabel-grid">
+                                    <div class="crop-compare-card main-crop">
+                                        <div class="card-tag tag-main">Inspected Crop</div>
+                                        <div class="crop-image-wrapper">
+                                            <img id="mis-img-main" src="" alt="Crop">
+                                        </div>
+                                        <div class="crop-details">
+                                            <span class="crop-id" id="mis-id-main">crop_0128</span>
+                                            <span class="crop-reason-text" id="mis-reason-text">Majority of neighbors are Apple.</span>
+                                        </div>
+                                    </div>
+
+                                    <!-- Neighbors List -->
+                                    <div class="neighbors-panel">
+                                        <h4><i class="fa-solid fa-network-wired"></i> Nearest Neighbors in Embedding Space</h4>
+                                        <div class="neighbors-list" id="mis-neighbors-list">
+                                            <!-- Dynamically filled neighbors -->
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="inspector-actions horizontal">
+                                    <button class="btn btn-success flex-grow" id="btn-mis-relabel">
+                                        <i class="fa-solid fa-tag"></i> Relabel to <span id="btn-relabel-text">Apple</span>
+                                    </button>
+                                    <button class="btn btn-secondary" id="btn-mis-keep">
+                                        <i class="fa-solid fa-circle-check"></i> Keep Current Label
+                                    </button>
+                                    <button class="btn btn-danger" id="btn-mis-delete">
+                                        <i class="fa-solid fa-trash"></i> Delete Crop
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- TAB 5: DATA EXPLORER -->
+                <section class="tab-pane" id="tab-explorer">
+                    <!-- Filters Grid -->
+                    <div class="explorer-filter-panel card">
+                        <div class="card-body filter-grid-layout">
+                            <div class="search-box">
+                                <i class="fa-solid fa-magnifying-glass"></i>
+                                <input type="text" id="explorer-search" placeholder="Search by crop ID...">
+                            </div>
+
+                            <div class="filter-dropdown">
+                                <label for="filter-class">Class</label>
+                                <select id="filter-class">
+                                    <option value="all">All Classes</option>
+                                    <!-- Populated dynamically -->
+                                </select>
+                            </div>
+
+                            <div class="filter-dropdown">
+                                <label for="filter-anomaly">Quality Flag</label>
+                                <select id="filter-anomaly">
+                                    <option value="all">All Items</option>
+                                    <option value="clean">Clean Items Only</option>
+                                    <option value="flagged">Flagged (Any Anomaly)</option>
+                                    <option value="duplicate">Duplicates Only</option>
+                                    <option value="outlier">Outliers Only</option>
+                                    <option value="mislabel">Mislabels Only</option>
+                                    <option value="resolved">Resolved Items</option>
+                                </select>
+                            </div>
+
+                            <div class="filter-dropdown">
+                                <label for="sort-by">Sort By</label>
+                                <select id="sort-by">
+                                    <option value="index-asc">ID / Index (Asc)</option>
+                                    <option value="centroid-desc">Centroid Similarity (High to Low)</option>
+                                    <option value="centroid-asc">Centroid Similarity (Low to High)</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Explorer Layout -->
+                    <div class="explorer-grid-view">
+                        <!-- Crops Grid -->
+                        <div class="explorer-list-card card">
+                            <div class="card-header">
+                                <div class="card-title" id="explorer-grid-title">All Dataset Items (0)</div>
+                            </div>
+                            <div class="card-body grid-scroll scrollable">
+                                <div class="crops-card-grid" id="explorer-crops-grid">
+                                    <!-- Dynamically filled grid of all items -->
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Inspection Side Panel -->
+                        <div class="explorer-inspector card" id="explorer-detail-panel">
+                            <div class="card-body empty-state-msg" id="exp-empty-state">
+                                <i class="fa-solid fa-circle-info"></i>
+                                <h3>Select a Crop to Inspect</h3>
+                                <p>Click on any crop card in the grid to view its vector details, centroid distance, nearest neighbors, and change actions.</p>
+                            </div>
+                            
+                            <div class="card-body inspector-content hidden" id="exp-inspector-content">
+                                <h3 class="inspector-section-title"><i class="fa-solid fa-image"></i> Crop Inspector</h3>
+                                
+                                <div class="exp-crop-card">
+                                    <div class="crop-image-wrapper border-glow" id="exp-glow-border">
+                                        <img id="exp-img" src="" alt="Crop image">
+                                    </div>
+                                    <div class="exp-details-list">
+                                        <div class="detail-row">
+                                            <span class="detail-name">Crop ID</span>
+                                            <span class="detail-val font-mono" id="exp-id">crop_0000</span>
+                                        </div>
+                                        <div class="detail-row">
+                                            <span class="detail-name">Class Label</span>
+                                            <span class="class-pill" id="exp-label">Apple</span>
+                                        </div>
+                                        <div class="detail-row">
+                                            <span class="detail-name">Centroid Similarity</span>
+                                            <span class="detail-val font-mono" id="exp-sim-centroid">0.945</span>
+                                        </div>
+                                        <div class="detail-row">
+                                            <span class="detail-name">KNN similarity</span>
+                                            <span class="detail-val font-mono" id="exp-sim-knn">0.932</span>
+                                        </div>
+                                        <div class="detail-row">
+                                            <span class="detail-name">Dataset Status</span>
+                                            <div class="badge-list" id="exp-status-badges">
+                                                <!-- Dynamic status badges -->
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="exp-actions-block">
+                                    <h4>Dataset Actions</h4>
+                                    <div class="action-buttons-group">
+                                        <button class="btn btn-secondary btn-full" id="btn-exp-keep">
+                                            <i class="fa-solid fa-circle-check"></i> Keep / Approve Crop
+                                        </button>
+                                        <div class="flex-row gap-8">
+                                            <button class="btn btn-warning flex-grow" id="btn-exp-relabel">
+                                                <i class="fa-solid fa-pen-to-square"></i> Relabel Crop
+                                            </button>
+                                            <button class="btn btn-danger flex-grow" id="btn-exp-delete">
+                                                <i class="fa-solid fa-trash"></i> Delete Crop
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="exp-relabel-overlay hidden" id="relabel-dropdown-container">
+                                    <label for="exp-relabel-select">Select New Label:</label>
+                                    <div class="flex-row gap-8">
+                                        <select id="exp-relabel-select" class="flex-grow">
+                                            <!-- Dynamically filled with classes -->
+                                        </select>
+                                        <button class="btn btn-success" id="btn-exp-confirm-relabel">Confirm</button>
+                                        <button class="btn btn-secondary" id="btn-exp-cancel-relabel">Cancel</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+            </div>
+        </main>
+    </div>
+
+    <!-- Export Floating Panel -->
+    <div class="export-floating-bar card">
+        <div class="export-bar-content">
+            <div class="export-summary-text">
+                <i class="fa-solid fa-circle-check text-success"></i>
+                <span id="export-actions-summary">0 curation actions ready to export</span>
+            </div>
+            <button class="btn btn-success" id="btn-export-actions">
+                <i class="fa-solid fa-file-export"></i> Export Curation File (.json)
+            </button>
+            <button class="btn btn-primary" id="btn-commit-writeback">
+                <i class="fa-solid fa-floppy-disk"></i> Commit to Dataset (Writeback)
+            </button>
+        </div>
+    </div>
+
+    <!-- Global JS Preloaded Data (fallback or initial load) -->
+    <script src="demo_dataset/curation_report.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
