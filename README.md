@@ -40,6 +40,9 @@ graph TD
 
 ---
 
+<img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/9623f663-7d20-4365-a6e3-a8408ccdb7a5" />
+
+
 ## Key Features
 
 | Feature | Detail |
