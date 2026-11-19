@@ -1,38 +1,49 @@
 /**
- * CleanCrop - Dataset Quality & Curation Dashboard JavaScript Engine
- * Core Functionality:
- * 1. Embeddings Projection via Web PCA Power Method
- * 2. Real-time Curation Metrics Re-computation
- * 3. Interactive Embedding Space Canvas Plot (Pan, Zoom, Hover, Select)
- * 4. Human-in-the-Loop Curation Actions (Exclude, Relabel, Keep)
- * 5. Dynamic Report JSON Upload and Curation Export
+ * CleanCrop - Dataset Quality & Curation Dashboard
+ * 1. Loads the precomputed report (neighbors, duplicate pairs, outlier scores,
+ *    out-of-fold label predictions and PCA coordinates come from Python, so the
+ *    browser stays fast with thousands of boxes)
+ * 2. Live threshold tuning + human review (keep / relabel / delete)
+ * 3. Review decisions are auto-saved to the local server and can be written
+ *    back to the YOLO label files (with automatic backups)
  */
 
 (function () {
     // APP STATE
-    let reportData = null;      // Holds the active dataset curation report
-    let activeTab = 'overview'; // Active dashboard navigation tab
-    
-    // User Curation State (Manual Overrides)
-    const deletedIds = new Set();               // Excluded crops
-    const relabeledLabels = new Map();          // Map of ID -> New Class Label String
-    const keptIds = new Set();                  // Crops manually approved (clears outlier/mislabel flags)
-    const ignoredDuplicates = new Set();        // Set of "idA-idB" duplicate pairs marked false positive
-    const actionsLog = [];                      // Array of changes made for auditing
-    
-    // Algorithmic Parameters (Sliders)
-    let dupThreshold = 0.95;
-    let outCentroidThreshold = 0.85;
-    let outKnnThreshold = 0.50;
-    let mislabelK = 5;
-    let mislabelConsensus = 0.50; // Ratio of same-label neighbors
-    
-    // PCA / Plot State
-    let pcaCoordinates = []; // Projected 2D coordinates [[x, y], ...]
+    let reportData = null;
+    let activeTab = 'overview';
+    let classNames = [];
+
+    // Review decisions (auto-saved to the server)
+    const deletedIds = new Set();
+    const relabeledLabels = new Map();          // id -> new class name
+    const keptIds = new Set();                  // reviewed and confirmed correct
+    const ignoredDuplicates = new Set();        // "idA|idB" pairs marked as not duplicates
+    const actionsLog = [];
+    let serverAvailable = false;
+    let saveTimer = null;
+
+    // Thresholds (sliders)
+    let dupThreshold = 0.97;
+    let lofThreshold = 1.5;
+    let mislabelConf = 0.7;
+
+    // Flag lists derived from the thresholds
+    let mislabelList = [];
+    let outlierList = [];
+    let issueList = [];
+    let duplicateList = [];
+
+    // Paging for big lists
+    const PAGE = 150;
+    const shown = { mislabels: PAGE, outliers: PAGE, issues: PAGE, explorer: 300, duplicates: PAGE, backgrounds: 120 };
+
+    // PCA / Plot State (used by the canvas code)
+    let pcaCoordinates = [];
+    let map2dCoordinates = [];
     let classColors = {};
     let defaultColor = '#58a6ff';
-    
-    // Canvas View State
+
     const canvas = document.getElementById('embedding-canvas');
     const ctx = canvas.getContext('2d');
     let viewZoom = 1.0;
@@ -44,1161 +55,801 @@
     let hoveredIndex = -1;
     let selectedIndex = -1;
     let showAnomalyRings = true;
-    
-    // 3D Mode State
+
     let is3D = false;
     let rotationX = -0.5;
     let rotationY = 0.6;
     let dragRotationStart = { x: 0, y: 0 };
-    
-    // Initial Load
-    window.addEventListener('DOMContentLoaded', () => {
-        // 1. Check if global CURATION_REPORT is loaded from file
-        if (window.CURATION_REPORT) {
-            loadDataset(window.CURATION_REPORT);
-        } else {
-            showErrorState("No dataset loaded. Please upload a curation JSON report.");
-        }
-        
-        // 2. Set up Nav Event Listeners
-        document.querySelectorAll('.menu-item').forEach(item => {
-            item.addEventListener('click', () => {
-                switchTab(item.getAttribute('data-tab'));
-            });
-        });
-        
-        // 3. Set up Slider Listeners
-        setupSliders();
-        
-        // 4. Set up Canvas Event Listeners
-        setupCanvas();
-        
-        // 5. File Upload Handler
-        document.getElementById('json-upload').addEventListener('change', handleFileUpload);
-        
-        // 6. Action Button Handlers
-        setupActionButtons();
-    });
+
+    // Mislabel review cursor (position in mislabelList)
+    let misCursor = -1;
+
+    const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const pct = v => (v === null || v === undefined) ? 'n/a' : `${(v * 100).toFixed(0)}%`;
 
     // ==========================================================================
-    // DATA LOADING & COMPUTE PIPELINE
+    // INIT
     // ==========================================================================
-    
+
+    window.addEventListener('DOMContentLoaded', async () => {
+        if (!window.CURATION_REPORT) {
+            showErrorState("No analysis found. Run: python dataset_curator_yolo.py <your dataset folder>");
+            return;
+        }
+
+        document.querySelectorAll('.menu-item').forEach(item => {
+            item.addEventListener('click', () => switchTab(item.getAttribute('data-tab')));
+        });
+        setupSliders();
+        setupCanvas();
+        setupActionButtons();
+        setupFrameViewer();
+        setupKeyboard();
+
+        await loadSavedState();
+        loadDataset(window.CURATION_REPORT);
+    });
+
+    async function loadSavedState() {
+        try {
+            const res = await fetch('/api/state', { cache: 'no-store' });
+            if (!res.ok) throw new Error(res.status);
+            const st = await res.json();
+            serverAvailable = true;
+            (st.deleted || []).forEach(id => deletedIds.add(id));
+            Object.entries(st.relabeled || {}).forEach(([id, lbl]) => relabeledLabels.set(id, lbl));
+            (st.kept || []).forEach(id => keptIds.add(id));
+            (st.ignoredDuplicates || []).forEach(k => ignoredDuplicates.add(k));
+            (st.log || []).forEach(a => actionsLog.push(a));
+            if (st.thresholds) {
+                dupThreshold = st.thresholds.dup ?? dupThreshold;
+                lofThreshold = st.thresholds.lof ?? lofThreshold;
+                mislabelConf = st.thresholds.mis ?? mislabelConf;
+            }
+            window.__restoredThresholds = !!st.thresholds;
+        } catch (e) {
+            serverAvailable = false;
+        }
+        const note = document.getElementById('save-status');
+        note.textContent = serverAvailable ? 'Progress auto-saves' : 'Opened as a file: progress is NOT saved and changes cannot be written. Start it with CleanCrop.bat.';
+        note.classList.toggle('warn', !serverAvailable);
+    }
+
+    function saveState() {
+        if (!serverAvailable) return;
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => {
+            fetch('/api/state', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    deleted: [...deletedIds],
+                    relabeled: Object.fromEntries(relabeledLabels),
+                    kept: [...keptIds],
+                    ignoredDuplicates: [...ignoredDuplicates],
+                    log: actionsLog,
+                    thresholds: { dup: dupThreshold, lof: lofThreshold, mis: mislabelConf },
+                }),
+            }).catch(() => {
+                document.getElementById('save-status').textContent = 'Could not save progress - is the CleanCrop window still open?';
+            });
+        }, 300);
+    }
+
+    // ==========================================================================
+    // DATA LOADING & FLAG ENGINE
+    // ==========================================================================
+
     function loadDataset(report) {
         reportData = report;
-        
-        // Set initial slider parameters matching report
-        if (report.summary) {
-            dupThreshold = report.summary.duplicate_threshold || 0.95;
-            outCentroidThreshold = report.summary.outlier_threshold_centroid || 0.85;
-            outKnnThreshold = report.summary.outlier_threshold_knn;
-            if (!outKnnThreshold || outKnnThreshold > 1.0) {
-                outKnnThreshold = 0.50;
-            }
-            mislabelK = report.summary.mislabel_k || 5;
-            
-            document.getElementById('slider-dup').value = dupThreshold;
-            document.getElementById('val-dup').textContent = dupThreshold.toFixed(2);
-            document.getElementById('slider-out-centroid').value = outCentroidThreshold;
-            document.getElementById('val-out-centroid').textContent = outCentroidThreshold.toFixed(2);
-            document.getElementById('slider-mis-k').value = mislabelK;
-            document.getElementById('val-mis-k').textContent = mislabelK;
+        classNames = report.class_names && report.class_names.length
+            ? report.class_names
+            : [...new Set(report.items.map(it => it.label))];
+
+        document.getElementById('dataset-name').textContent = report.dataset_name || 'Dataset';
+        document.getElementById('dataset-meta').textContent =
+            `${report.items.filter(it => !it.removed).length} boxes · ${report.stats ? report.stats.images : '?'} images · ${(report.model || '').toUpperCase()}`;
+
+        const p = report.params || {};
+        if (!window.__restoredThresholds) {
+            dupThreshold = p.dup_threshold ?? dupThreshold;
+            lofThreshold = p.lof_threshold ?? lofThreshold;
+            mislabelConf = p.mislabel_conf ?? mislabelConf;
         }
-        
-        // Extract Unique Classes from items
-        const classes = [...new Set(reportData.items.map(item => item.label))];
-        
-        // Clear classColors and dynamically assign class colors
+        const sliderDup = document.getElementById('slider-dup');
+        sliderDup.min = Math.min(p.dup_floor ?? 0.9, dupThreshold).toFixed(2);
+        sliderDup.value = dupThreshold;
+        document.getElementById('slider-lof').value = lofThreshold;
+        document.getElementById('slider-mis-conf').value = mislabelConf;
+        updateSliderLabels();
+
         classColors = {};
-        const hues = [0, 45, 135, 200, 275, 310, 25, 75, 170, 225, 290, 340];
-        classes.forEach((cls, idx) => {
+        const hues = [200, 330, 45, 135, 275, 0, 25, 75, 170, 225, 290, 340];
+        classNames.forEach((cls, idx) => {
             classColors[cls] = `hsl(${hues[idx % hues.length]}, 85%, 60%)`;
         });
-        
-        // Populate Filter dropdowns
+
         const filterClass = document.getElementById('filter-class');
-        filterClass.innerHTML = '<option value="all">All Classes</option>';
-        classes.forEach(cls => {
-            filterClass.innerHTML += `<option value="${cls}">${cls}</option>`;
-        });
-        
-        const expRelabelSelect = document.getElementById('exp-relabel-select');
-        expRelabelSelect.innerHTML = '';
-        classes.forEach(cls => {
-            expRelabelSelect.innerHTML += `<option value="${cls}">${cls}</option>`;
-        });
-        
-        // Run PCA on high-dim embeddings
-        console.log("Computing PCA Projection in browser...");
-        const t0 = performance.now();
-        if (reportData.embeddings && reportData.embeddings.length > 0) {
-            pcaCoordinates = computePCA(reportData.embeddings, 3);
-        } else {
-            // Fallback synthetic PCA if embeddings are missing
-            pcaCoordinates = reportData.items.map((item, idx) => {
-                const angle = (idx / reportData.items.length) * Math.PI * 2;
-                return [Math.cos(angle) * 2, Math.sin(angle) * 2, Math.sin(angle * 2) * 0.5];
-            });
-        }
-        console.log(`PCA computed in ${(performance.now() - t0).toFixed(1)}ms.`);
-        
-        // Reset manual curation logs
-        deletedIds.clear();
-        relabeledLabels.clear();
-        keptIds.clear();
-        ignoredDuplicates.clear();
-        actionsLog.length = 0;
-        selectedIndex = -1;
-        hoveredIndex = -1;
-        
-        // Run Curation Engine
+        filterClass.innerHTML = '<option value="all">All Classes</option>' +
+            classNames.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+        const filterSplit = document.getElementById('filter-split');
+        const splits = [...new Set(report.items.map(it => it.split))];
+        filterSplit.innerHTML = '<option value="all">All Splits</option>' +
+            splits.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+        document.getElementById('exp-relabel-select').innerHTML = classOptions();
+
+        pcaCoordinates = report.items.map(it => it.pca || [0, 0, 0]);
+        map2dCoordinates = report.items.map(it => it.map2d || null);
+
         recomputeCuration();
-        
-        // Fit canvas viewpoint to data
         resetCanvasView();
     }
-    
-    /**
-     * SVD/PCA Projection using Power Iteration Method
-     * Projects N x D normalized embeddings to N x 2 space
-     */
-    function computePCA(X, numComponents = 2) {
-        const N = X.length;
-        const D = X[0].length;
-        
-        // 1. Center the data
-        const mean = new Array(D).fill(0);
-        for (let i = 0; i < N; i++) {
-            for (let j = 0; j < D; j++) {
-                mean[j] += X[i][j];
-            }
-        }
-        for (let j = 0; j < D; j++) mean[j] /= N;
-        
-        const Xc = [];
-        for (let i = 0; i < N; i++) {
-            Xc.push(X[i].map((val, j) => val - mean[j]));
-        }
-        
-        // Matrix-vector multiplication for covariance estimate: Xc^T * (Xc * v)
-        function covarianceProduct(v) {
-            const Xv = new Array(N).fill(0);
-            for (let i = 0; i < N; i++) {
-                for (let j = 0; j < D; j++) {
-                    Xv[i] += Xc[i][j] * v[j];
-                }
-            }
-            const XT_Xv = new Array(D).fill(0);
-            for (let j = 0; j < D; j++) {
-                for (let i = 0; i < N; i++) {
-                    XT_Xv[j] += Xc[i][j] * Xv[i];
-                }
-            }
-            return XT_Xv;
-        }
-        
-        function normalize(v) {
-            const len = Math.sqrt(v.reduce((sum, val) => sum + val * val, 0));
-            return len > 1e-9 ? v.map(val => val / len) : v;
-        }
-        
-        const pcs = [];
-        let tempX = Xc;
-        
-        for (let c = 0; c < numComponents; c++) {
-            let v = new Array(D).fill(0).map(() => Math.random() - 0.5);
-            v = normalize(v);
-            
-            // Power Method iterations
-            for (let iter = 0; iter < 12; iter++) {
-                v = covarianceProduct(v);
-                v = normalize(v);
-            }
-            pcs.push(v);
-            
-            // Deflate Matrix to find the next orthogonal component
-            if (c < numComponents - 1) {
-                for (let i = 0; i < N; i++) {
-                    let proj = 0;
-                    for (let j = 0; j < D; j++) proj += Xc[i][j] * v[j];
-                    for (let j = 0; j < D; j++) Xc[i][j] -= proj * v[j];
-                }
-            }
-        }
-        
-        // Project centered points onto PCs
-        const projected = [];
-        for (let i = 0; i < N; i++) {
-            const row = [];
-            for (let c = 0; c < numComponents; c++) {
-                let sum = 0;
-                for (let j = 0; j < D; j++) {
-                    sum += Xc[i][j] * pcs[c][j];
-                }
-                row.push(sum);
-            }
-            projected.push(row);
-        }
-        
-        return projected;
+
+    function classOptions(selected) {
+        return classNames.map(c => `<option value="${esc(c)}" ${c === selected ? 'selected' : ''}>${esc(c)}</option>`).join('');
     }
-    
-    /**
-     * CORE ALGORITHMIC ENGINE
-     * Performs vector operations to flag duplicates, outliers, and mislabeled crops.
-     * Computes dynamically in-browser when slider configurations change.
-     */
+
     function recomputeCuration() {
         if (!reportData) return;
-        
-        const t0 = performance.now();
         const items = reportData.items;
-        const embs = reportData.embeddings;
-        const N = items.length;
-        const D = (embs && embs.length > 0) ? embs[0].length : 128;
-        
-        // 1. Reset all active flags
+
         items.forEach(item => {
-            item.is_duplicate = false;
-            item.is_outlier = false;
-            item.is_mislabeled = false;
-            item.duplicate_pairs = [];
-            
-            // Get curbed status
             item.curLabel = relabeledLabels.get(item.id) || item.label;
-            item.curDeleted = deletedIds.has(item.id);
+            item.curDeleted = deletedIds.has(item.id) || !!item.removed;
             item.curKept = keptIds.has(item.id);
+            const reviewed = item.curKept || relabeledLabels.has(item.id) || !!item.relabeled_from;
+            const active = !item.curDeleted;
+
+            item.is_mislabeled = active && !reviewed && !!item.pred && item.pred !== item.curLabel &&
+                (item.pred_conf || 0) >= mislabelConf;
+            item.is_outlier = active && !reviewed && item.lof >= lofThreshold;
+            item.has_issue = active && !item.curKept && item.issues && item.issues.length > 0;
+            item.is_duplicate = false;
         });
-        
-        // 2. DUPLICATE DETECTION (All pairs cosine similarity)
-        const activeDuplicatePairs = [];
-        const dupSet = new Set();
-        
-        for (let i = 0; i < N; i++) {
-            if (items[i].curDeleted) continue;
-            for (let j = i + 1; j < N; j++) {
-                if (items[j].curDeleted) continue;
-                
-                // Cosine Similarity = dot product of normalized embeddings
-                let sim = 0;
-                for (let d = 0; d < D; d++) {
-                    sim += embs[i][d] * embs[j][d];
-                }
-                
-                if (sim >= dupThreshold) {
-                    const pairKey = items[i].id < items[j].id ? `${items[i].id}-${items[j].id}` : `${items[j].id}-${items[i].id}`;
-                    if (ignoredDuplicates.has(pairKey)) continue;
-                    
-                    items[i].is_duplicate = true;
-                    items[j].is_duplicate = true;
-                    
-                    items[i].duplicate_pairs.push({ index: j, sim: sim });
-                    items[j].duplicate_pairs.push({ index: i, sim: sim });
-                    
-                    dupSet.add(i);
-                    dupSet.add(j);
-                    
-                    activeDuplicatePairs.push({
-                        pairKey: pairKey,
-                        a: items[i],
-                        b: items[j],
-                        indexA: i,
-                        indexB: j,
-                        similarity: sim
-                    });
-                }
-            }
-        }
-        
-        // 3. OUTLIERS & MISLABELS (Centroids + KNN)
-        // Group indices of active items by their current label
-        const classGroups = {};
-        for (let i = 0; i < N; i++) {
-            if (items[i].curDeleted) continue;
-            const lbl = items[i].curLabel;
-            if (!classGroups[lbl]) classGroups[lbl] = [];
-            classGroups[lbl].push(i);
-        }
-        
-        // Calculate Class Centroids (mean vector normalized)
-        const centroids = {};
-        for (const [clsName, indices] of Object.entries(classGroups)) {
-            if (indices.length === 0) continue;
-            const centroid = new Array(D).fill(0);
-            indices.forEach(idx => {
-                for (let d = 0; d < D; d++) {
-                    centroid[d] += embs[idx][d];
-                }
-            });
-            // Normalize centroid
-            let len = Math.sqrt(centroid.reduce((sum, val) => sum + val * val, 0));
-            centroids[clsName] = len > 1e-9 ? centroid.map(val => val / len) : centroid;
-        }
-        
-        const activeOutliers = [];
-        const activeMislabels = [];
-        
-        // Neighbor Analysis & Outlier Scoring
-        for (let i = 0; i < N; i++) {
-            if (items[i].curDeleted) continue;
-            
-            // A. Centroid Similarity
-            const myCentroid = centroids[items[i].curLabel];
-            let centroidSim = 0;
-            if (myCentroid) {
-                for (let d = 0; d < D; d++) {
-                    centroidSim += embs[i][d] * myCentroid[d];
-                }
-            }
-            items[i].centroid_similarity = centroidSim;
-            
-            // B. Neighbors Query
-            const sims = [];
-            for (let j = 0; j < N; j++) {
-                if (i === j || items[j].curDeleted) continue;
-                let dot = 0;
-                for (let d = 0; d < D; d++) {
-                    dot += embs[i][d] * embs[j][d];
-                }
-                sims.push({ index: j, sim: dot, label: items[j].curLabel, id: items[j].id });
-            }
-            
-            // Sort to get KNN nearest neighbors
-            sims.sort((a, b) => b.sim - a.sim);
-            const knn = sims.slice(0, mislabelK);
-            
-            // Calculate KNN average similarity
-            let knnSum = 0;
-            knn.forEach(n => knnSum += n.sim);
-            const knnSim = knn.length > 0 ? knnSum / knn.length : 0;
-            items[i].knn_similarity = knnSim;
-            
-            // C. Outlier flagging
-            const isCentroidOutlier = centroidSim < outCentroidThreshold;
-            const isKnnOutlier = knnSim < outKnnThreshold;
-            const isOutlier = isCentroidOutlier || isKnnOutlier;
-            
-            if (isOutlier && !items[i].curKept) {
-                items[i].is_outlier = true;
-                
-                let reason = "";
-                if (isCentroidOutlier && isKnnOutlier) {
-                    reason = `Low similarity to both centroid (${centroidSim.toFixed(2)}) and neighbors (${knnSim.toFixed(2)}).`;
-                } else if (isCentroidOutlier) {
-                    reason = `Low similarity to centroid (${centroidSim.toFixed(2)}). Centroid threshold: ${outCentroidThreshold.toFixed(2)}.`;
-                } else {
-                    reason = `Low similarity to neighbors (${knnSim.toFixed(2)}). KNN threshold: ${outKnnThreshold.toFixed(2)}.`;
-                }
-                
-                activeOutliers.push({
-                    index: i,
-                    id: items[i].id,
-                    label: items[i].curLabel,
-                    path: items[i].path,
-                    centroid_similarity: centroidSim,
-                    knn_similarity: knnSim,
-                    reason: reason,
-                    is_centroid: isCentroidOutlier,
-                    is_knn: isKnnOutlier
-                });
-            }
-            
-            // D. Mislabel checking
-            let ownClassCount = 0;
-            const labelCounts = {};
-            
-            knn.forEach(n => {
-                if (n.label === items[i].curLabel) ownClassCount++;
-                labelCounts[n.label] = (labelCounts[n.label] || 0) + 1;
-            });
-            
-            const ownClassRatio = knn.length > 0 ? ownClassCount / knn.length : 1.0;
-            
-            // Suspected mislabeled if neighborhood label ratio falls below consensus threshold
-            const isMislabeled = ownClassRatio < mislabelConsensus;
-            
-            if (isMislabeled && !items[i].curKept) {
-                items[i].is_mislabeled = true;
-                
-                // Find suggested majority label
-                let maxCount = -1;
-                let suggested = items[i].curLabel;
-                for (const [cls, count] of Object.entries(labelCounts)) {
-                    if (count > maxCount) {
-                        maxCount = count;
-                        suggested = cls;
-                    }
-                }
-                
-                items[i].suggested_label = suggested;
-                items[i].mislabel_reason = `Only ${ownClassCount}/${knn.length} nearest neighbors belong to '${items[i].curLabel}'. Suggested: '${suggested}' (${maxCount}/${knn.length} neighbors).`;
-                
-                activeMislabels.push({
-                    index: i,
-                    id: items[i].id,
-                    label: items[i].curLabel,
-                    path: items[i].path,
-                    suggested_label: suggested,
-                    reason: items[i].mislabel_reason,
-                    neighbors: knn.map(n => ({
-                        id: n.id,
-                        label: n.label,
-                        sim: n.sim,
-                        path: items[n.index].path
-                    }))
-                });
-            }
-        }
-        
-        // 4. UPDATE STATS & BIND LISTS TO REPORT OBJECT
-        reportData.duplicates = activeDuplicatePairs;
-        reportData.outliers = activeOutliers;
-        reportData.mislabels = activeMislabels;
-        
-        const duplicateCount = dupSet.size;
-        const outlierCount = activeOutliers.length;
-        const mislabelCount = activeMislabels.length;
-        
-        // Calculate clean count
-        let unionIndices = new Set();
-        items.forEach((item, idx) => {
-            if (item.curDeleted) return;
-            if (item.is_duplicate || item.is_outlier || item.is_mislabeled) {
-                unionIndices.add(idx);
-            }
+
+        duplicateList = [];
+        (reportData.duplicates || []).forEach(([i, j, sim]) => {
+            if (sim < dupThreshold) return;
+            const a = items[i], b = items[j];
+            if (!a || !b || a.curDeleted || b.curDeleted) return;
+            const key = `${a.id}|${b.id}`;
+            if (ignoredDuplicates.has(key)) return;
+            a.is_duplicate = true;
+            b.is_duplicate = true;
+            duplicateList.push({ pairKey: key, a, b, indexA: i, indexB: j, similarity: sim });
         });
-        
-        const activeTotal = N - deletedIds.size;
-        const cleanCount = activeTotal - unionIndices.size;
-        const healthScore = activeTotal > 0 ? (cleanCount / activeTotal) * 100 : 100;
-        
-        // Save dynamically calculated summary
+        // Train/val leaks first - they inflate your validation scores
+        duplicateList.sort((x, y) => (y.a.split !== y.b.split) - (x.a.split !== x.b.split) || y.similarity - x.similarity);
+
+        mislabelList = items.filter(it => it.is_mislabeled).sort((a, b) => b.pred_conf - a.pred_conf);
+        outlierList = items.filter(it => it.is_outlier).sort((a, b) => b.lof - a.lof);
+        issueList = items.filter(it => it.has_issue);
+
+        const active = items.filter(it => !it.curDeleted);
+        const flagged = active.filter(it => it.is_mislabeled || it.is_outlier || it.has_issue || it.is_duplicate).length;
         reportData.summary = {
-            total_samples: activeTotal,
-            duplicate_count: duplicateCount,
-            duplicate_pairs_count: activeDuplicatePairs.length,
-            outlier_count: outlierCount,
-            mislabel_count: mislabelCount,
-            clean_count: cleanCount,
-            health_score: healthScore
+            total_samples: active.length,
+            duplicate_pairs_count: duplicateList.length,
+            outlier_count: outlierList.length,
+            mislabel_count: mislabelList.length,
+            issue_count: issueList.length,
+            clean_count: active.length - flagged,
+            health_score: active.length ? ((active.length - flagged) / active.length) * 100 : 100,
         };
-        
-        console.log(`Dynamic curation recompute completed in ${(performance.now() - t0).toFixed(1)}ms.`);
-        
-        // 5. UPDATE USER INTERFACE
+
         updateUI();
     }
-    
+
     // ==========================================================================
     // UI UPDATES & TAB ROUTING
     // ==========================================================================
-    
+
     function updateUI() {
         if (!reportData) return;
-        
-        const summary = reportData.summary;
-        
-        // Update Sidebar Count Badges
-        document.getElementById('badge-dup-count').textContent = summary.duplicate_pairs_count;
-        document.getElementById('badge-out-count').textContent = summary.outlier_count;
-        document.getElementById('badge-mis-count').textContent = summary.mislabel_count;
-        
-        // Update Overview Cards
-        document.getElementById('stat-health-score').textContent = `${summary.health_score.toFixed(1)}%`;
-        document.getElementById('stat-duplicate-count').textContent = summary.duplicate_pairs_count;
-        document.getElementById('stat-outlier-count').textContent = summary.outlier_count;
-        document.getElementById('stat-mislabel-count').textContent = summary.mislabel_count;
-        
-        // Render Active Tab Content
+        const s = reportData.summary;
+
+        document.getElementById('badge-dup-count').textContent = s.duplicate_pairs_count;
+        document.getElementById('badge-out-count').textContent = s.outlier_count;
+        document.getElementById('badge-mis-count').textContent = s.mislabel_count;
+        document.getElementById('badge-issue-count').textContent = s.issue_count;
+
+        document.getElementById('stat-health-score').textContent = `${s.health_score.toFixed(1)}%`;
+        document.getElementById('stat-duplicate-count').textContent = s.duplicate_pairs_count;
+        document.getElementById('stat-outlier-count').textContent = s.outlier_count;
+        document.getElementById('stat-mislabel-count').textContent = s.mislabel_count;
+        document.getElementById('stat-issue-count').textContent = s.issue_count;
+        const nBg = (reportData.backgrounds || []).length;
+        const nImg = reportData.stats ? reportData.stats.images : 0;
+        document.getElementById('stat-bg-count').textContent = nImg ? `${nBg} (${(100 * nBg / nImg).toFixed(1)}%)` : `${nBg}`;
+        document.getElementById('badge-bg-count').textContent = nBg;
+
         renderActiveTab();
-        
-        // Render Canvas Scatter Plot
         drawCanvas();
-        
-        // Update Curation Action Floating Bar
         updateExportBar();
     }
-    
+
+    const TAB_TITLES = {
+        overview: ["Overview", "Dataset health at a glance. Start with Suspected Mislabels, then Unusual Boxes."],
+        mislabels: ["Suspected Mislabels", "A classifier that never saw these boxes disagrees with their label. Keys: R = accept suggestion, K = label is correct, D = delete box, ↑/↓ = move, F = full frame."],
+        outliers: ["Unusual Boxes", "Boxes that look unlike the rest of their class: wrong object, bad crop, background, other species..."],
+        issues: ["Broken / Double Boxes", "Boxes annotated twice, conflicting labels on the same object, boxes outside the image or unknown class ids."],
+        duplicates: ["Near-Duplicates", "Almost identical boxes from different images. Train↔val pairs are listed first: they inflate validation scores."],
+        explorer: ["All Boxes", "Search, filter and review any box. Click a thumbnail to inspect it."],
+        backgrounds: ["Backgrounds", "Images with no boxes (empty or missing label file). They teach the model what NOT to detect. Click one to see it full size."],
+        distribution: ["Distribution", "Where the data comes from (cameras, devices, day/night, box sizes) and whether it is ready for a golden test set."],
+    };
+
     function switchTab(tabId) {
         activeTab = tabId;
-        
-        // Update Sidebar Active state
         document.querySelectorAll('.menu-item').forEach(item => {
-            item.classList.remove('active');
-            if (item.getAttribute('data-tab') === tabId) {
-                item.classList.add('active');
-            }
+            item.classList.toggle('active', item.getAttribute('data-tab') === tabId);
         });
-        
-        // Update Main View Panels Visibility
-        document.querySelectorAll('.tab-pane').forEach(pane => {
-            pane.classList.remove('active');
-        });
+        document.querySelectorAll('.tab-pane').forEach(pane => pane.classList.remove('active'));
         document.getElementById(`tab-${tabId}`).classList.add('active');
-        
-        // Update Header Titles
-        const titles = {
-            'overview': { title: "Overview Dashboard", desc: "High-level insights and statistics on dataset health." },
-            'duplicates': { title: "Near-Duplicate Detection", desc: "Identify leaked or redundant crop pairs leaking metadata." },
-            'outliers': { title: "Outlier Crop Detector", desc: "Crops exhibiting anomalous embedding behaviors (junk/bad crops)." },
-            'mislabels': { title: "Label Consensus Inspector", desc: "Crops mismatched against their embedding nearest neighbors." },
-            'explorer': { title: "Interactive Crop Explorer", desc: "Search, filter, and inspect embedding representations." }
-        };
-        
-        document.getElementById('current-tab-title').textContent = titles[tabId].title;
-        document.getElementById('current-tab-desc').textContent = titles[tabId].desc;
-        
+        document.getElementById('current-tab-title').textContent = TAB_TITLES[tabId][0];
+        document.getElementById('current-tab-desc').textContent = TAB_TITLES[tabId][1];
         renderActiveTab();
+        if (tabId === 'overview') resetCanvasView();
+        if (tabId === 'mislabels' && mislabelList.length && misCursor < 0) selectMislabelItem(0);
     }
-    
+
     function renderActiveTab() {
         if (!reportData) return;
-        
         switch (activeTab) {
-            case 'overview':
-                renderOverviewTab();
-                break;
-            case 'duplicates':
-                renderDuplicatesTab();
-                break;
-            case 'outliers':
-                renderOutliersTab();
-                break;
-            case 'mislabels':
-                renderMislabelsTab();
-                break;
-            case 'explorer':
-                renderExplorerTab();
-                break;
+            case 'overview': renderOverviewTab(); break;
+            case 'duplicates': renderDuplicatesTab(); break;
+            case 'outliers': renderCardGrid('outliers'); break;
+            case 'issues': renderCardGrid('issues'); break;
+            case 'mislabels': renderMislabelsTab(); break;
+            case 'explorer': renderExplorerTab(); break;
+            case 'backgrounds': renderBackgroundsTab(); break;
+            case 'distribution': renderDistributionTab(); break;
         }
     }
-    
-    // --- 1. OVERVIEW TAB ---
+
+    function thumb(item, extra = '') {
+        return `<img src="${esc(item.path)}" alt="${esc(item.id)}" loading="lazy" data-frame="${esc(item.id)}" title="Click to see the full frame" ${extra}>`;
+    }
+
+    function pill(label) {
+        const c = classColors[label] || defaultColor;
+        return `<span class="class-pill" style="background-color:${c}22;color:${c};border:1px solid ${c}55">${esc(label)}</span>`;
+    }
+
+    function moreButton(key, total) {
+        return total > shown[key]
+            ? `<button class="btn btn-secondary btn-small load-more" data-more="${key}">Show more (${total - shown[key]} left)</button>`
+            : '';
+    }
+
+    function wireMoreButtons(container) {
+        container.querySelectorAll('[data-more]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                shown[btn.dataset.more] += btn.dataset.more === 'explorer' ? 300 : PAGE;
+                renderActiveTab();
+            });
+        });
+    }
+
+    // --- 1. OVERVIEW ---
     function renderOverviewTab() {
         const items = reportData.items;
-        
-        // A. Class Distribution count
         const classCounts = {};
         let activeCount = 0;
-        
         items.forEach(item => {
             if (item.curDeleted) return;
             classCounts[item.curLabel] = (classCounts[item.curLabel] || 0) + 1;
             activeCount++;
         });
-        
-        const listContainer = document.getElementById('class-distribution-list');
-        listContainer.innerHTML = '';
-        
-        const sortedClasses = Object.entries(classCounts).sort((a, b) => b[1] - a[1]);
-        
-        sortedClasses.forEach(([clsName, count]) => {
-            const pct = activeCount > 0 ? (count / activeCount) * 100 : 0;
-            const color = classColors[clsName] || defaultColor;
-            
-            listContainer.innerHTML += `
-                <div class="bar-row">
-                    <div class="bar-label">
-                        <span class="bar-class-name">${clsName}</span>
-                        <span class="bar-count-val">${count} crops (${pct.toFixed(1)}%)</span>
-                    </div>
-                    <div class="bar-outer">
-                        <div class="bar-inner" style="width: ${pct}%; background-color: ${color};"></div>
-                    </div>
-                </div>
-            `;
-        });
-        
-        // Populate Legend in Plot
-        const legendContainer = document.getElementById('plot-legend');
-        legendContainer.innerHTML = '';
-        Object.entries(classColors).forEach(([clsName, color]) => {
-            legendContainer.innerHTML += `
-                <div class="legend-item">
-                    <div class="legend-dot" style="background-color: ${color};"></div>
-                    <span>${clsName}</span>
-                </div>
-            `;
-        });
-        
-        // B. Metric Inflation Risk Meter
-        const dupPct = activeCount > 0 ? (reportData.summary.duplicate_count / activeCount) * 100 : 0;
-        const meterFill = document.getElementById('meter-fill');
-        const meterScore = document.getElementById('meter-score');
-        
-        // Rotate meter representation based on duplicate ratio
-        const degree = Math.min(180, (dupPct / 15) * 180) - 45;
-        meterFill.style.transform = `rotate(${degree}deg)`;
-        
-        if (dupPct > 8) {
-            meterScore.textContent = "High";
-            meterScore.style.color = "var(--color-outlier)";
-            meterFill.style.borderColor = "var(--color-outlier)";
-        } else if (dupPct > 3) {
-            meterScore.textContent = "Med";
-            meterScore.style.color = "var(--color-mislabel)";
-            meterFill.style.borderColor = "var(--color-mislabel)";
-        } else {
-            meterScore.textContent = "Low";
-            meterScore.style.color = "var(--color-clean)";
-            meterFill.style.borderColor = "var(--color-clean)";
-        }
-        
-        // C. Curation Progress Tracker
-        const totalAnomalies = reportData.summary.duplicate_pairs_count + reportData.summary.outlier_count + reportData.summary.mislabel_count;
-        const totalResolved = actionsLog.length;
-        const progressPct = totalAnomalies + totalResolved > 0 ? (totalResolved / (totalAnomalies + totalResolved)) * 100 : 100;
-        
+
+        document.getElementById('class-distribution-list').innerHTML = Object.entries(classCounts)
+            .sort((a, b) => b[1] - a[1])
+            .map(([cls, count]) => {
+                const p = activeCount ? (count / activeCount) * 100 : 0;
+                return `<div class="bar-row">
+                    <div class="bar-label"><span class="bar-class-name">${esc(cls)}</span>
+                    <span class="bar-count-val">${count} boxes (${p.toFixed(1)}%)</span></div>
+                    <div class="bar-outer"><div class="bar-inner" style="width:${Math.max(p, 0.5)}%;background-color:${classColors[cls] || defaultColor};"></div></div>
+                </div>`;
+            }).join('');
+
+        document.getElementById('plot-legend').innerHTML = Object.entries(classColors).map(([cls, color]) =>
+            `<div class="legend-item"><div class="legend-dot" style="background-color:${color};"></div><span>${esc(cls)}</span></div>`).join('');
+
+        // Dataset facts from the scan
+        const st = reportData.stats || {};
+        const splitTxt = st.splits ? Object.entries(st.splits).map(([k, v]) => `${esc(k)}: ${v.images} images / ${v.boxes} boxes`).join('<br>') : '';
+        const problems = reportData.problems || [];
+        document.getElementById('dataset-facts').innerHTML = `
+            <div class="fact-row"><span>Images</span><b>${st.images ?? '?'}</b></div>
+            <div class="fact-row"><span>Images with no boxes</span><b>${st.background_images ?? '?'}${st.images ? ` (${(100 * (st.background_images || 0) / st.images).toFixed(1)}%)` : ''}</b></div>
+            <div class="fact-row"><span>Boxes</span><b>${activeCount}</b></div>
+            <div class="fact-row"><span>Unreadable label lines</span><b class="${problems.length ? 'bad' : ''}">${problems.length}</b></div>
+            <div class="fact-split">${splitTxt}</div>`;
+
+        const totalFlags = mislabelList.length + outlierList.length + issueList.length + duplicateList.length;
+        const done = deletedIds.size + relabeledLabels.size + keptIds.size;
+        const progressPct = totalFlags + done > 0 ? (done / (totalFlags + done)) * 100 : 100;
         document.getElementById('curation-progress').style.width = `${progressPct}%`;
-        document.getElementById('curation-progress-text').textContent = `${totalResolved} action(s) registered`;
+        document.getElementById('curation-progress-text').textContent = `${done} reviewed · ${totalFlags} still flagged`;
     }
-    
-    // --- 2. DUPLICATES TAB ---
+
+    // --- 2. DUPLICATES ---
     function renderDuplicatesTab() {
         const listContainer = document.getElementById('dup-list-container');
-        const countTitle = document.getElementById('dup-pairs-title');
-        
-        const dups = reportData.duplicates || [];
-        countTitle.textContent = `Duplicate Pairs (${dups.length})`;
-        
-        if (dups.length === 0) {
-            listContainer.innerHTML = `
-                <div class="empty-state-msg" style="height: 100px;">
-                    <i class="fa-solid fa-copy" style="font-size:24px;"></i>
-                    <p>No duplicates found at current similarity threshold.</p>
-                </div>
-            `;
+        document.getElementById('dup-pairs-title').textContent = `Duplicate Pairs (${duplicateList.length})`;
+
+        if (duplicateList.length === 0) {
+            listContainer.innerHTML = `<div class="empty-state-msg" style="height:100px;"><i class="fa-solid fa-copy" style="font-size:24px;"></i><p>No near-duplicates at this similarity threshold.</p></div>`;
             document.getElementById('dup-empty-state').classList.remove('hidden');
             document.getElementById('dup-inspector-content').classList.add('hidden');
             return;
         }
-        
-        listContainer.innerHTML = '';
-        dups.forEach((pair, idx) => {
-            const isASelected = selectedIndex === pair.indexA;
-            const isBSelected = selectedIndex === pair.indexB;
-            const isPairSelected = isASelected || isBSelected;
-            
-            listContainer.innerHTML += `
-                <div class="item-list-card ${isPairSelected ? 'active' : ''}" data-pair-idx="${idx}">
-                    <div class="list-item-meta">
-                        <div class="item-thumbnail">
-                            <img src="${pair.a.path}" alt="Crop A">
-                        </div>
-                        <div class="item-thumbnail">
-                            <img src="${pair.b.path}" alt="Crop B">
-                        </div>
-                        <div class="item-text-info">
-                            <span class="item-text-title">${pair.a.id} & ${pair.b.id}</span>
-                            <span class="item-text-subtitle">Class: ${pair.a.curLabel}</span>
-                        </div>
+
+        listContainer.innerHTML = duplicateList.slice(0, shown.duplicates).map((pair, idx) => {
+            const leak = pair.a.split !== pair.b.split;
+            return `<div class="item-list-card" data-pair-idx="${idx}">
+                <div class="list-item-meta">
+                    <div class="item-thumbnail"><img src="${esc(pair.a.path)}" loading="lazy"></div>
+                    <div class="item-thumbnail"><img src="${esc(pair.b.path)}" loading="lazy"></div>
+                    <div class="item-text-info">
+                        <span class="item-text-title">${esc(pair.a.id)}<br>${esc(pair.b.id)}</span>
+                        <span class="item-text-subtitle">${leak ? `<b class="leak">${esc(pair.a.split)} ↔ ${esc(pair.b.split)} leak</b>` : esc(pair.a.split)} · ${esc(pair.a.curLabel)}</span>
                     </div>
-                    <div class="item-list-stat dup">${(pair.similarity * 100).toFixed(1)}%</div>
                 </div>
-            `;
-        });
-        
-        // Add click listener on cards
+                <div class="item-list-stat dup">${(pair.similarity * 100).toFixed(1)}%</div>
+            </div>`;
+        }).join('') + moreButton('duplicates', duplicateList.length);
+
         listContainer.querySelectorAll('.item-list-card').forEach(card => {
-            card.addEventListener('click', () => {
-                const pairIdx = parseInt(card.getAttribute('data-pair-idx'));
-                selectDuplicatePair(pairIdx);
-            });
+            card.addEventListener('click', () => selectDuplicatePair(parseInt(card.dataset.pairIdx)));
         });
-        
-        // Keep active selection in view or show empty inspector
-        const activeCard = listContainer.querySelector('.item-list-card.active');
-        if (!activeCard) {
-            document.getElementById('dup-empty-state').classList.remove('hidden');
-            document.getElementById('dup-inspector-content').classList.add('hidden');
-        }
+        wireMoreButtons(listContainer);
+        document.getElementById('dup-empty-state').classList.remove('hidden');
+        document.getElementById('dup-inspector-content').classList.add('hidden');
     }
-    
+
     function selectDuplicatePair(idx) {
-        const pair = reportData.duplicates[idx];
+        const pair = duplicateList[idx];
         if (!pair) return;
-        
-        // Highlight active pair cards
         document.querySelectorAll('#dup-list-container .item-list-card').forEach((card, cidx) => {
-            if (cidx === idx) card.classList.add('active');
-            else card.classList.remove('active');
+            card.classList.toggle('active', cidx === idx);
         });
-        
         document.getElementById('dup-empty-state').classList.add('hidden');
         const inspector = document.getElementById('dup-inspector-content');
         inspector.classList.remove('hidden');
-        
-        // Bind values
+
         document.getElementById('dup-similarity-value').textContent = `${(pair.similarity * 100).toFixed(1)}%`;
-        
-        document.getElementById('dup-id-a').textContent = pair.a.id;
+        document.getElementById('dup-id-a').textContent = `${pair.a.id} (${pair.a.split})`;
         document.getElementById('dup-label-a').textContent = pair.a.curLabel;
         document.getElementById('dup-img-a').src = pair.a.path;
-        
-        document.getElementById('dup-id-b').textContent = pair.b.id;
+        document.getElementById('dup-img-a').dataset.frame = pair.a.id;
+        document.getElementById('dup-id-b').textContent = `${pair.b.id} (${pair.b.split})`;
         document.getElementById('dup-label-b').textContent = pair.b.curLabel;
         document.getElementById('dup-img-b').src = pair.b.path;
-        
-        // Assign action triggers
-        const btnDeleteA = inspector.querySelector('.btn-delete-crop[data-target="a"]');
-        const btnDeleteB = inspector.querySelector('.btn-delete-crop[data-target="b"]');
-        const btnKeepBoth = document.getElementById('btn-dup-keep-both');
-        
-        btnDeleteA.onclick = () => excludeCrop(pair.a.id, `Resolved duplicate pair ${pair.pairKey} by retaining ${pair.b.id}`);
-        btnDeleteB.onclick = () => excludeCrop(pair.b.id, `Resolved duplicate pair ${pair.pairKey} by retaining ${pair.a.id}`);
-        btnKeepBoth.onclick = () => {
+        document.getElementById('dup-img-b').dataset.frame = pair.b.id;
+
+        inspector.querySelector('.btn-delete-crop[data-target="a"]').onclick = () => excludeCrop(pair.a.id, `Deleted duplicate of ${pair.b.id}`);
+        inspector.querySelector('.btn-delete-crop[data-target="b"]').onclick = () => excludeCrop(pair.b.id, `Deleted duplicate of ${pair.a.id}`);
+        document.getElementById('btn-dup-keep-both').onclick = () => {
             ignoredDuplicates.add(pair.pairKey);
-            registerAction({
-                type: 'ignore_duplicate',
-                pairKey: pair.pairKey,
-                a: pair.a.id,
-                b: pair.b.id,
-                description: `Flagged duplicate pair ${pair.pairKey} as false positive (kept both).`
-            });
+            registerAction({ type: 'ignore_duplicate', id: pair.pairKey, description: `Kept both ${pair.a.id} and ${pair.b.id}.` });
             recomputeCuration();
         };
     }
-    
-    // --- 3. OUTLIERS TAB ---
-    function renderOutliersTab() {
-        const gridContainer = document.getElementById('outliers-grid-container');
-        const statsInfo = document.getElementById('outliers-stats');
-        
-        const outliers = reportData.outliers || [];
-        statsInfo.textContent = `Showing ${outliers.length} flagged outlier crops`;
-        
-        if (outliers.length === 0) {
-            gridContainer.innerHTML = `
-                <div class="empty-state-msg" style="grid-column: 1/-1; height: 200px;">
-                    <i class="fa-solid fa-triangle-exclamation" style="font-size: 32px;"></i>
-                    <h3>No Outliers Found</h3>
-                    <p>Try reducing the Centroid Similarity or KNN threshold sliders to capture less distinct outliers.</p>
-                </div>
-            `;
+
+    // --- 3/4. OUTLIERS + BOX ISSUES (shared card grid) ---
+    function renderCardGrid(kind) {
+        const list = kind === 'outliers' ? outlierList : issueList;
+        const grid = document.getElementById(`${kind}-grid-container`);
+        document.getElementById(`${kind}-stats`).textContent = `${list.length} boxes to review` +
+            (kind === 'outliers' ? ' (most unusual first)' : '');
+
+        if (list.length === 0) {
+            grid.innerHTML = `<div class="empty-state-msg" style="grid-column:1/-1;height:200px;">
+                <i class="fa-solid fa-circle-check" style="font-size:32px;color:var(--color-clean)"></i>
+                <h3>Nothing left to review here</h3>
+                ${kind === 'outliers' ? '<p>Lower the "Unusual box" slider to see more borderline boxes.</p>' : ''}</div>`;
             return;
         }
-        
-        gridContainer.innerHTML = '';
-        outliers.forEach(out => {
-            const itemClassColor = classColors[out.label] || defaultColor;
-            gridContainer.innerHTML += `
-                <div class="outlier-card" id="out-card-${out.id}">
-                    <div class="outlier-badge">OUTLIER</div>
-                    <div class="crop-image-wrapper">
-                        <img src="${out.path}" alt="${out.id}">
-                    </div>
-                    <span class="crop-id">${out.id}</span>
-                    <span class="class-pill" style="background-color: ${itemClassColor}22; color: ${itemClassColor}; border: 1px solid ${itemClassColor}33">${out.label}</span>
-                    
-                    <p class="outlier-reason">${out.reason}</p>
-                    
-                    <div class="outlier-scores">
-                        <div class="score-row">
-                            <span class="score-lbl">Centroid Sim</span>
-                            <span class="score-val ${out.is_centroid ? 'bad' : ''}">${out.centroid_similarity.toFixed(3)}</span>
-                        </div>
-                        <div class="score-row">
-                            <span class="score-lbl">KNN Sim</span>
-                            <span class="score-val ${out.is_knn ? 'bad' : ''}">${out.knn_similarity.toFixed(3)}</span>
-                        </div>
-                    </div>
-                    
-                    <div class="action-buttons-group" style="width: 100%;">
-                        <button class="btn btn-danger btn-block btn-small btn-exclude-out" data-id="${out.id}">
-                            <i class="fa-solid fa-trash"></i> Exclude / Delete
-                        </button>
-                        <button class="btn btn-secondary btn-block btn-small btn-keep-out" data-id="${out.id}">
-                            <i class="fa-solid fa-check"></i> Keep Crop
-                        </button>
-                    </div>
+
+        grid.innerHTML = list.slice(0, shown[kind]).map(it => {
+            const reason = kind === 'outliers'
+                ? `Unusual for '${esc(it.curLabel)}' (score ${it.lof.toFixed(2)})` + (it.pred && it.pred !== it.curLabel ? `<br>Model thinks: <b>${esc(it.pred)}</b> (${pct(it.pred_conf)})` : '')
+                : it.issues.map(esc).join('<br>');
+            return `<div class="outlier-card">
+                <div class="outlier-badge ${kind === 'issues' ? 'issue' : ''}">${kind === 'issues' ? 'BOX ISSUE' : 'UNUSUAL'}</div>
+                <div class="crop-image-wrapper">${thumb(it)}</div>
+                <span class="crop-id" title="${esc(it.image)}">${esc(it.id)} · ${esc(it.split)}</span>
+                ${pill(it.curLabel)}
+                <p class="outlier-reason">${reason}</p>
+                <div class="action-buttons-group" style="width:100%;">
+                    <button class="btn btn-secondary btn-block btn-small" data-act="keep" data-id="${esc(it.id)}"><i class="fa-solid fa-check"></i> Correct, keep</button>
+                    <select class="card-relabel" data-id="${esc(it.id)}"><option value="">Relabel to…</option>${classNames.filter(c => c !== it.curLabel).map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('')}</select>
+                    <button class="btn btn-danger btn-block btn-small" data-act="delete" data-id="${esc(it.id)}"><i class="fa-solid fa-trash"></i> Delete box</button>
                 </div>
-            `;
-        });
-        
-        // Add card button event listeners
-        gridContainer.querySelectorAll('.btn-exclude-out').forEach(btn => {
-            btn.addEventListener('click', () => {
-                excludeCrop(btn.getAttribute('data-id'), "Manually excluded class outlier crop.");
-            });
-        });
-        
-        gridContainer.querySelectorAll('.btn-keep-out').forEach(btn => {
-            btn.addEventListener('click', () => {
-                approveCrop(btn.getAttribute('data-id'), "Manually approved outlier crop.");
-            });
-        });
+            </div>`;
+        }).join('') + `<div style="grid-column:1/-1">${moreButton(kind, list.length)}</div>`;
+
+        grid.querySelectorAll('[data-act="keep"]').forEach(btn => btn.addEventListener('click', () => approveCrop(btn.dataset.id, `Confirmed ${kind === 'issues' ? 'box issue' : 'unusual box'} is fine.`)));
+        grid.querySelectorAll('[data-act="delete"]').forEach(btn => btn.addEventListener('click', () => excludeCrop(btn.dataset.id, `Deleted ${kind === 'issues' ? 'broken/double' : 'unusual'} box.`)));
+        grid.querySelectorAll('.card-relabel').forEach(sel => sel.addEventListener('change', () => {
+            const it = itemById(sel.dataset.id);
+            if (sel.value && it) relabelCrop(it.id, it.curLabel, sel.value);
+        }));
+        wireMoreButtons(grid);
     }
-    
-    // --- 4. MISLABELS TAB ---
+
+    // --- 5. MISLABELS ---
     function renderMislabelsTab() {
         const listContainer = document.getElementById('mis-list-container');
-        const countTitle = document.getElementById('mis-items-title');
-        
-        const mislabels = reportData.mislabels || [];
-        countTitle.textContent = `Suspected Wrong Labels (${mislabels.length})`;
-        
-        if (mislabels.length === 0) {
-            listContainer.innerHTML = `
-                <div class="empty-state-msg" style="height: 100px;">
-                    <i class="fa-solid fa-tag" style="font-size:24px;"></i>
-                    <p>No suspected mislabels found at current consensus threshold.</p>
-                </div>
-            `;
+        document.getElementById('mis-items-title').textContent = `Suspected Wrong Labels (${mislabelList.length})`;
+
+        if (mislabelList.length === 0) {
+            listContainer.innerHTML = `<div class="empty-state-msg" style="height:100px;"><i class="fa-solid fa-circle-check" style="font-size:24px;color:var(--color-clean)"></i><p>No suspected mislabels at this confidence. Lower the slider to see borderline cases.</p></div>`;
             document.getElementById('mis-empty-state').classList.remove('hidden');
             document.getElementById('mis-inspector-content').classList.add('hidden');
+            misCursor = -1;
             return;
         }
-        
-        listContainer.innerHTML = '';
-        mislabels.forEach((mis, idx) => {
-            const isSelected = selectedIndex === mis.index;
-            listContainer.innerHTML += `
-                <div class="item-list-card ${isSelected ? 'active' : ''}" data-mis-idx="${idx}">
-                    <div class="list-item-meta">
-                        <div class="item-thumbnail">
-                            <img src="${mis.path}" alt="${mis.id}">
-                        </div>
-                        <div class="item-text-info">
-                            <span class="item-text-title">${mis.id}</span>
-                            <span class="item-text-subtitle">Labeled: <b style="color:var(--color-outlier);">${mis.label}</b> &rarr; Suggest: <b style="color:var(--color-clean);">${mis.suggested_label}</b></span>
-                        </div>
+
+        listContainer.innerHTML = mislabelList.slice(0, shown.mislabels).map((it, idx) => `
+            <div class="item-list-card ${idx === misCursor ? 'active' : ''}" data-mis-idx="${idx}">
+                <div class="list-item-meta">
+                    <div class="item-thumbnail"><img src="${esc(it.path)}" loading="lazy"></div>
+                    <div class="item-text-info">
+                        <span class="item-text-title">${esc(it.id)}</span>
+                        <span class="item-text-subtitle">Labeled <b style="color:var(--color-outlier);">${esc(it.curLabel)}</b> → looks like <b style="color:var(--color-clean);">${esc(it.pred)}</b></span>
                     </div>
-                    <div class="item-list-stat mis"><i class="fa-solid fa-triangle-exclamation"></i></div>
                 </div>
-            `;
-        });
-        
-        // Add click handler
+                <div class="item-list-stat mis">${pct(it.pred_conf)}</div>
+            </div>`).join('') + moreButton('mislabels', mislabelList.length);
+
         listContainer.querySelectorAll('.item-list-card').forEach(card => {
-            card.addEventListener('click', () => {
-                const misIdx = parseInt(card.getAttribute('data-mis-idx'));
-                selectMislabelItem(misIdx);
-            });
+            card.addEventListener('click', () => selectMislabelItem(parseInt(card.dataset.misIdx)));
         });
-        
-        // Manage active panel state
-        const activeCard = listContainer.querySelector('.item-list-card.active');
-        if (!activeCard) {
+        wireMoreButtons(listContainer);
+
+        if (misCursor >= 0) {
+            selectMislabelItem(Math.min(misCursor, mislabelList.length - 1));
+        } else {
             document.getElementById('mis-empty-state').classList.remove('hidden');
             document.getElementById('mis-inspector-content').classList.add('hidden');
         }
     }
-    
+
     function selectMislabelItem(idx) {
-        const mis = reportData.mislabels[idx];
-        if (!mis) return;
-        
-        selectedIndex = mis.index;
-        
-        // Highlight in list
-        document.querySelectorAll('#mis-list-container .item-list-card').forEach((card, cidx) => {
-            if (cidx === idx) card.classList.add('active');
-            else card.classList.remove('active');
+        const it = mislabelList[idx];
+        if (!it) return;
+        misCursor = idx;
+        selectedIndex = it.index;
+
+        document.querySelectorAll('#mis-list-container .item-list-card').forEach(card => {
+            const active = parseInt(card.dataset.misIdx) === idx;
+            card.classList.toggle('active', active);
+            if (active) card.scrollIntoView({ block: 'nearest' });
         });
-        
         document.getElementById('mis-empty-state').classList.add('hidden');
-        const inspector = document.getElementById('mis-inspector-content');
-        inspector.classList.remove('hidden');
-        
-        // Bind UI values
-        document.getElementById('mis-label-current').textContent = mis.label;
-        document.getElementById('mis-label-suggested').textContent = mis.suggested_label;
-        document.getElementById('mis-img-main').src = mis.path;
-        document.getElementById('mis-id-main').textContent = mis.id;
-        document.getElementById('mis-reason-text').textContent = mis.reason;
-        
-        document.getElementById('btn-relabel-text').textContent = mis.suggested_label;
-        
-        // Fill Nearest Neighbors list
-        const neighborsList = document.getElementById('mis-neighbors-list');
-        neighborsList.innerHTML = '';
-        
-        mis.neighbors.forEach(n => {
-            const classColor = classColors[n.label] || defaultColor;
-            neighborsList.innerHTML += `
-                <div class="neighbor-card">
-                    <div class="neighbor-meta">
-                        <div class="neighbor-thumb">
-                            <img src="${n.path}" alt="${n.id}">
-                        </div>
-                        <span class="neighbor-id">${n.id}</span>
-                        <span class="class-pill neighbor-class" style="background-color: ${classColor}22; color: ${classColor}; border: 1px solid ${classColor}33;">${n.label}</span>
-                    </div>
-                    <span class="neighbor-sim">${(n.sim * 100).toFixed(1)}%</span>
+        document.getElementById('mis-inspector-content').classList.remove('hidden');
+
+        document.getElementById('mis-label-current').textContent = it.curLabel;
+        document.getElementById('mis-label-suggested').textContent = it.pred;
+        const img = document.getElementById('mis-img-main');
+        img.src = it.path;
+        img.dataset.frame = it.id;
+        document.getElementById('mis-id-main').textContent = `${it.id} · ${it.split}`;
+
+        const nbrs = (it.nbrs || []).map(([j, sim]) => ({ item: reportData.items[j], sim })).filter(n => n.item && !n.item.curDeleted);
+        const agree = nbrs.filter(n => n.item.curLabel === it.pred).length;
+        document.getElementById('mis-reason-text').innerHTML =
+            `Classifier: <b>${pct(it.pred_conf)}</b> sure this is '<b>${esc(it.pred)}</b>' (only ${pct(it.given_conf)} for '${esc(it.curLabel)}').<br>` +
+            `${agree} of ${nbrs.length} most similar boxes are labeled '${esc(it.pred)}'.`;
+        document.getElementById('btn-relabel-text').textContent = it.pred;
+
+        document.getElementById('mis-neighbors-list').innerHTML = nbrs.slice(0, 8).map(n => `
+            <div class="neighbor-card">
+                <div class="neighbor-meta">
+                    <div class="neighbor-thumb">${thumb(n.item)}</div>
+                    <span class="neighbor-id">${esc(n.item.id)}</span>
+                    ${pill(n.item.curLabel)}
                 </div>
-            `;
-        });
-        
-        // Wire up buttons
-        document.getElementById('btn-mis-relabel').onclick = () => relabelCrop(mis.id, mis.label, mis.suggested_label);
-        document.getElementById('btn-mis-keep').onclick = () => approveCrop(mis.id, `Approved label '${mis.label}' after neighborhood check.`);
-        document.getElementById('btn-mis-delete').onclick = () => excludeCrop(mis.id, "Deleted suspected mislabeled crop.");
+                <span class="neighbor-sim">${(n.sim * 100).toFixed(1)}%</span>
+            </div>`).join('');
+
+        document.getElementById('mis-relabel-other').innerHTML = '<option value="">Other class…</option>' +
+            classNames.filter(c => c !== it.curLabel && c !== it.pred).map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+        document.getElementById('mis-relabel-other').onchange = e => { if (e.target.value) relabelCrop(it.id, it.curLabel, e.target.value); };
+
+        document.getElementById('btn-mis-relabel').onclick = () => relabelCrop(it.id, it.curLabel, it.pred);
+        document.getElementById('btn-mis-keep').onclick = () => approveCrop(it.id, `Confirmed label '${it.curLabel}'.`);
+        document.getElementById('btn-mis-delete').onclick = () => excludeCrop(it.id, 'Deleted suspected mislabeled box.');
+        document.getElementById('btn-mis-frame').onclick = () => openFrame(it.id);
     }
-    
-    // --- 5. EXPLORER TAB ---
+
+    // --- 6. EXPLORER ---
     function renderExplorerTab() {
-        const gridContainer = document.getElementById('explorer-crops-grid');
-        const searchVal = document.getElementById('explorer-search').value.toLowerCase();
+        const grid = document.getElementById('explorer-crops-grid');
+        const searchVal = document.getElementById('explorer-search').value.toLowerCase().trim();
         const selectedClass = document.getElementById('filter-class').value;
-        const selectedAnomaly = document.getElementById('filter-anomaly').value;
+        const selectedSplit = document.getElementById('filter-split').value;
+        const selectedFlag = document.getElementById('filter-anomaly').value;
         const sortBy = document.getElementById('sort-by').value;
-        
-        const items = reportData.items;
-        
-        // A. Filter Items
-        let filtered = items.map((item, idx) => ({ ...item, originalIdx: idx }));
-        
-        if (searchVal) {
-            filtered = filtered.filter(item => item.id.toLowerCase().includes(searchVal));
-        }
-        
-        if (selectedClass !== 'all') {
-            filtered = filtered.filter(item => item.curLabel === selectedClass);
-        }
-        
-        if (selectedAnomaly !== 'all') {
-            if (selectedAnomaly === 'clean') {
-                filtered = filtered.filter(item => !item.curDeleted && !item.is_duplicate && !item.is_outlier && !item.is_mislabeled);
-            } else if (selectedAnomaly === 'flagged') {
-                filtered = filtered.filter(item => !item.curDeleted && (item.is_duplicate || item.is_outlier || item.is_mislabeled));
-            } else if (selectedAnomaly === 'duplicate') {
-                filtered = filtered.filter(item => !item.curDeleted && item.is_duplicate);
-            } else if (selectedAnomaly === 'outlier') {
-                filtered = filtered.filter(item => !item.curDeleted && item.is_outlier);
-            } else if (selectedAnomaly === 'mislabel') {
-                filtered = filtered.filter(item => !item.curDeleted && item.is_mislabeled);
-            } else if (selectedAnomaly === 'resolved') {
-                filtered = filtered.filter(item => item.curDeleted || item.curKept || relabeledLabels.has(item.id));
-            }
-        }
-        
-        // B. Sort Items
-        if (sortBy === 'index-asc') {
-            filtered.sort((a, b) => a.originalIdx - b.originalIdx);
-        } else if (sortBy === 'centroid-desc') {
-            filtered.sort((a, b) => b.centroid_similarity - a.centroid_similarity);
-        } else if (sortBy === 'centroid-asc') {
-            filtered.sort((a, b) => a.centroid_similarity - b.centroid_similarity);
-        }
-        
-        document.getElementById('explorer-grid-title').textContent = `Dataset Items (${filtered.length})`;
-        
-        // C. Render Grid
-        gridContainer.innerHTML = '';
+
+        let filtered = reportData.items.filter(it => !it.removed);
+        if (searchVal) filtered = filtered.filter(it => it.id.toLowerCase().includes(searchVal) || it.image.toLowerCase().includes(searchVal));
+        if (selectedClass !== 'all') filtered = filtered.filter(it => it.curLabel === selectedClass);
+        if (selectedSplit !== 'all') filtered = filtered.filter(it => it.split === selectedSplit);
+        const flagFilters = {
+            clean: it => !it.curDeleted && !it.is_duplicate && !it.is_outlier && !it.is_mislabeled && !it.has_issue,
+            flagged: it => !it.curDeleted && (it.is_duplicate || it.is_outlier || it.is_mislabeled || it.has_issue),
+            duplicate: it => !it.curDeleted && it.is_duplicate,
+            outlier: it => !it.curDeleted && it.is_outlier,
+            mislabel: it => !it.curDeleted && it.is_mislabeled,
+            issue: it => !it.curDeleted && it.has_issue,
+            resolved: it => it.curDeleted || it.curKept || relabeledLabels.has(it.id),
+        };
+        if (flagFilters[selectedFlag]) filtered = filtered.filter(flagFilters[selectedFlag]);
+
+        const conf = it => it.given_conf ?? 1;
+        if (sortBy === 'lof-desc') filtered.sort((a, b) => b.lof - a.lof);
+        else if (sortBy === 'conf-asc') filtered.sort((a, b) => conf(a) - conf(b));
+        else if (sortBy === 'image') filtered.sort((a, b) => a.image.localeCompare(b.image) || a.line - b.line);
+
+        document.getElementById('explorer-grid-title').textContent = `Boxes (${filtered.length})`;
         if (filtered.length === 0) {
-            gridContainer.innerHTML = `<p style="grid-column: 1/-1; color: var(--text-secondary); text-align: center; padding: 20px;">No items match the current filters.</p>`;
+            grid.innerHTML = `<p style="grid-column:1/-1;color:var(--text-secondary);text-align:center;padding:20px;">No boxes match the current filters.</p>`;
             return;
         }
-        
-        filtered.forEach(item => {
-            let indicatorClass = "";
-            if (item.curDeleted) indicatorClass = ""; // Excluded is just opacity
-            else if (item.curKept) indicatorClass = "res";
-            else if (item.is_duplicate) indicatorClass = "dup";
-            else if (item.is_outlier) indicatorClass = "out";
-            else if (item.is_mislabeled) indicatorClass = "mis";
-            
-            const isSelected = selectedIndex === item.originalIdx;
-            
-            gridContainer.innerHTML += `
-                <div class="explorer-crop-thumb ${item.curDeleted ? 'resolved' : ''} ${isSelected ? 'active' : ''}" data-idx="${item.originalIdx}" title="${item.id} (${item.curLabel})">
-                    <img src="${item.path}" alt="${item.id}">
-                    ${indicatorClass ? `<div class="thumb-indicator ${indicatorClass}"></div>` : ''}
-                </div>
-            `;
+
+        grid.innerHTML = filtered.slice(0, shown.explorer).map(it => {
+            let ind = '';
+            if (it.curDeleted) ind = '';
+            else if (it.curKept || relabeledLabels.has(it.id)) ind = 'res';
+            else if (it.is_mislabeled) ind = 'mis';
+            else if (it.is_outlier || it.has_issue) ind = 'out';
+            else if (it.is_duplicate) ind = 'dup';
+            return `<div class="explorer-crop-thumb ${it.curDeleted ? 'resolved' : ''} ${selectedIndex === it.index ? 'active' : ''}" data-idx="${it.index}" title="${esc(it.id)} (${esc(it.curLabel)})">
+                <img src="${esc(it.path)}" alt="" loading="lazy">
+                ${ind ? `<div class="thumb-indicator ${ind}"></div>` : ''}
+            </div>`;
+        }).join('') + `<div style="grid-column:1/-1">${moreButton('explorer', filtered.length)}</div>`;
+
+        grid.querySelectorAll('.explorer-crop-thumb').forEach(t => {
+            t.addEventListener('click', () => selectExplorerItem(parseInt(t.dataset.idx)));
         });
-        
-        // Wire up selection click
-        gridContainer.querySelectorAll('.explorer-crop-thumb').forEach(thumb => {
-            thumb.addEventListener('click', () => {
-                const idx = parseInt(thumb.getAttribute('data-idx'));
-                selectExplorerItem(idx);
-            });
-        });
-        
-        // Keep detailed view in sync if selected item changed
-        if (selectedIndex >= 0) {
-            showExplorerDetail(selectedIndex);
-        } else {
+        wireMoreButtons(grid);
+
+        if (selectedIndex >= 0) showExplorerDetail(selectedIndex);
+        else {
             document.getElementById('exp-empty-state').classList.remove('hidden');
             document.getElementById('exp-inspector-content').classList.add('hidden');
         }
     }
-    
+
     function selectExplorerItem(idx) {
         selectedIndex = idx;
-        
-        // Toggle active border state in DOM
-        document.querySelectorAll('.explorer-crop-thumb').forEach(thumb => {
-            if (parseInt(thumb.getAttribute('data-idx')) === idx) thumb.classList.add('active');
-            else thumb.classList.remove('active');
+        document.querySelectorAll('.explorer-crop-thumb').forEach(t => {
+            t.classList.toggle('active', parseInt(t.dataset.idx) === idx);
         });
-        
         showExplorerDetail(idx);
+        drawCanvas();
     }
-    
+
     function showExplorerDetail(idx) {
         const item = reportData.items[idx];
         if (!item) return;
-        
         document.getElementById('exp-empty-state').classList.add('hidden');
-        const content = document.getElementById('exp-inspector-content');
-        content.classList.remove('hidden');
-        
-        // Bind UI Elements
-        document.getElementById('exp-img').src = item.path;
+        document.getElementById('exp-inspector-content').classList.remove('hidden');
+
+        const img = document.getElementById('exp-img');
+        img.src = item.path;
+        img.dataset.frame = item.id;
         document.getElementById('exp-id').textContent = item.id;
-        
+        document.getElementById('exp-image').textContent = `${item.split}/${item.image} (line ${item.line + 1})`;
+
         const labelPill = document.getElementById('exp-label');
-        labelPill.textContent = item.curLabel;
         const color = classColors[item.curLabel] || defaultColor;
+        labelPill.textContent = item.curLabel;
         labelPill.style.backgroundColor = color + "22";
         labelPill.style.color = color;
-        labelPill.style.border = `1px solid ${color}33`;
-        
-        document.getElementById('exp-sim-centroid').textContent = item.centroid_similarity !== undefined ? item.centroid_similarity.toFixed(4) : "N/A";
-        document.getElementById('exp-sim-knn').textContent = item.knn_similarity !== undefined ? item.knn_similarity.toFixed(4) : "N/A";
-        
-        // Set glow border based on quality state
-        const glowBorder = document.getElementById('exp-glow-border');
-        glowBorder.className = "crop-image-wrapper border-glow";
-        if (item.is_duplicate) glowBorder.classList.add('dup');
-        else if (item.is_outlier) glowBorder.classList.add('out');
-        else if (item.is_mislabeled) glowBorder.classList.add('mis');
-        
-        // Fill Status badges
-        const badgesContainer = document.getElementById('exp-status-badges');
-        badgesContainer.innerHTML = '';
-        if (item.curDeleted) {
-            badgesContainer.innerHTML += `<span class="exp-badge out">Deleted / Excluded</span>`;
-        } else if (item.curKept) {
-            badgesContainer.innerHTML += `<span class="exp-badge res">Approved / Kept</span>`;
-        } else {
-            let isClean = true;
-            if (item.is_duplicate) {
-                badgesContainer.innerHTML += `<span class="exp-badge dup">Duplicate</span>`;
-                isClean = false;
-            }
-            if (item.is_outlier) {
-                badgesContainer.innerHTML += `<span class="exp-badge out">Outlier</span>`;
-                isClean = false;
-            }
-            if (item.is_mislabeled) {
-                badgesContainer.innerHTML += `<span class="exp-badge mis">Suspected Mislabel</span>`;
-                isClean = false;
-            }
-            if (isClean) {
-                badgesContainer.innerHTML += `<span class="exp-badge clean">Clean</span>`;
-            }
+        labelPill.style.border = `1px solid ${color}55`;
+
+        document.getElementById('exp-model-says').textContent = item.pred ? `${item.pred} (${pct(item.pred_conf)})` : 'n/a';
+        document.getElementById('exp-sim-lof').textContent = item.lof ? item.lof.toFixed(2) : 'n/a';
+
+        const glow = document.getElementById('exp-glow-border');
+        glow.className = "crop-image-wrapper border-glow";
+        if (item.is_mislabeled) glow.classList.add('mis');
+        else if (item.is_outlier || item.has_issue) glow.classList.add('out');
+        else if (item.is_duplicate) glow.classList.add('dup');
+
+        const badges = [];
+        if (item.curDeleted) badges.push(`<span class="exp-badge out">Will be deleted</span>`);
+        else if (relabeledLabels.has(item.id)) badges.push(`<span class="exp-badge res">Relabeled from ${esc(item.label)}</span>`);
+        else if (item.curKept) badges.push(`<span class="exp-badge res">Confirmed correct</span>`);
+        else {
+            if (item.is_mislabeled) badges.push(`<span class="exp-badge mis">Suspected mislabel</span>`);
+            if (item.is_outlier) badges.push(`<span class="exp-badge out">Unusual</span>`);
+            if (item.has_issue) badges.push(`<span class="exp-badge out">${esc(item.issues.join('; '))}</span>`);
+            if (item.is_duplicate) badges.push(`<span class="exp-badge dup">Duplicate</span>`);
+            if (!badges.length) badges.push(`<span class="exp-badge clean">Clean</span>`);
         }
-        
-        // Manage active actions state based on item status
+        document.getElementById('exp-status-badges').innerHTML = badges.join('');
+
         const btnKeep = document.getElementById('btn-exp-keep');
         const btnRelabel = document.getElementById('btn-exp-relabel');
         const btnDelete = document.getElementById('btn-exp-delete');
-        
-        if (item.curDeleted) {
-            btnKeep.textContent = "Restore Crop";
-            btnKeep.className = "btn btn-success btn-full";
-            btnKeep.onclick = () => restoreCrop(item.id);
-            btnRelabel.disabled = true;
-            btnDelete.disabled = true;
+        const changed = item.curDeleted || relabeledLabels.has(item.id) || item.curKept;
+        if (changed && !item.removed) {
+            btnKeep.innerHTML = '<i class="fa-solid fa-rotate-left"></i> Undo my change';
+            btnKeep.disabled = false;
+            btnKeep.onclick = () => undoCrop(item.id);
         } else {
-            btnKeep.textContent = "Keep / Approve Crop";
-            btnKeep.className = "btn btn-secondary btn-full";
-            btnKeep.disabled = item.curKept || (!item.is_duplicate && !item.is_outlier && !item.is_mislabeled);
-            btnKeep.onclick = () => approveCrop(item.id, "Approved during explorer review.");
-            
-            btnRelabel.disabled = false;
-            btnDelete.disabled = false;
-            btnDelete.onclick = () => excludeCrop(item.id, "Deleted during explorer review.");
+            btnKeep.innerHTML = '<i class="fa-solid fa-circle-check"></i> Label is correct';
+            btnKeep.disabled = !!item.removed;
+            btnKeep.onclick = () => approveCrop(item.id, "Confirmed in explorer.");
         }
-        
-        // Hide relabel panel initially
+        btnRelabel.disabled = item.curDeleted;
+        btnDelete.disabled = item.curDeleted;
+        btnDelete.onclick = () => excludeCrop(item.id, "Deleted in explorer.");
         document.getElementById('relabel-dropdown-container').classList.add('hidden');
         btnRelabel.onclick = () => {
-            const dropdown = document.getElementById('relabel-dropdown-container');
-            dropdown.classList.toggle('hidden');
-            document.getElementById('exp-relabel-select').value = item.curLabel;
+            document.getElementById('relabel-dropdown-container').classList.toggle('hidden');
+            document.getElementById('exp-relabel-select').innerHTML = classOptions(item.curLabel);
         };
     }
-    
+
+    // --- 7. BACKGROUNDS ---
+    function bgUrl(bg, w) {
+        return `/api/bgimage?path=${encodeURIComponent(`${bg.split}/${bg.image}`)}${w ? `&w=${w}` : ''}`;
+    }
+
+    function renderBackgroundsTab() {
+        const bgs = reportData.backgrounds || [];
+        const st = reportData.stats || {};
+        document.getElementById('bg-stats').textContent = bgs.length
+            ? `${bgs.length} background images (${st.images ? (100 * bgs.length / st.images).toFixed(1) : '?'}% of ${st.images ?? '?'} images). A healthy share is roughly 10-35%.`
+            : 'No background images: every image has at least one box. Consider adding 10-35% empty frames to reduce false positives.';
+        const grid = document.getElementById('bg-grid');
+        if (!serverAvailable) {
+            grid.innerHTML = `<p style="grid-column:1/-1;color:var(--text-secondary)">Background thumbnails need the CleanCrop server (start it with CleanCrop.bat).</p>`;
+            return;
+        }
+        grid.innerHTML = bgs.slice(0, shown.backgrounds).map((bg, i) => `<div class="bg-card">
+                <img src="${bgUrl(bg, 400)}" loading="lazy" data-bg="${i}" alt="">
+                <div>${esc(bg.split)} · ${esc(bg.image)}${bg.camera && bg.camera !== 'unknown' ? ` · ${esc(bg.camera)}` : ''}${bg.period ? ` · ${esc(bg.period)}` : ''}${bg.missing_label ? ' · <b>no label file</b>' : ''}</div>
+            </div>`).join('') + `<div style="grid-column:1/-1">${moreButton('backgrounds', bgs.length)}</div>`;
+        grid.querySelectorAll('img[data-bg]').forEach(img => img.addEventListener('click', () => {
+            const bg = bgs[+img.dataset.bg];
+            document.getElementById('frame-img').src = bgUrl(bg);
+            document.getElementById('frame-caption').textContent = `${bg.split}/${bg.image} — background image (no boxes). Click or press Esc to close.`;
+            document.getElementById('frame-modal').classList.remove('hidden');
+        }));
+        wireMoreButtons(grid);
+    }
+
+    // --- 8. DISTRIBUTION ---
+    function barsHtml(rows, color) {
+        const max = Math.max(1, ...rows.map(r => r[1]));
+        return rows.map(([name, val, note]) => `<div class="bar-row">
+                <div class="bar-label"><span class="bar-class-name">${esc(name)}</span><span class="bar-count-val">${val}${note ? ` · ${esc(note)}` : ''}</span></div>
+                <div class="bar-outer"><div class="bar-inner" style="width:${Math.max(100 * val / max, 0.5)}%;background-color:${color || defaultColor};"></div></div>
+            </div>`).join('');
+    }
+
+    function distCard(title, icon, body) {
+        return `<div class="card"><div class="card-header"><div class="card-title"><i class="fa-solid ${icon}"></i> ${esc(title)}</div></div>
+            <div class="card-body"><div class="bar-chart-list">${body}</div></div></div>`;
+    }
+
+    function renderDistributionTab() {
+        const d = reportData.distribution;
+        const list = document.getElementById('readiness-list');
+        const grid = document.getElementById('dist-grid');
+        if (!d) {
+            list.innerHTML = '<p class="meter-desc">This report was made by an older CleanCrop version. Run the analysis again to see the distribution.</p>';
+            grid.innerHTML = '';
+            return;
+        }
+        // The review check is live: it uses the current decisions instead of the analysis-time count
+        const unresolved = mislabelList.length + outlierList.length;
+        const checks = (d.readiness || []).map(c => c.check.startsWith('Mislabels') ? {
+            ...c, status: unresolved ? 'warn' : 'pass',
+            reason: unresolved ? `${mislabelList.length} suspected mislabels + ${outlierList.length} unusual boxes not reviewed yet` : 'all flagged boxes reviewed',
+        } : c);
+        list.innerHTML = checks.map(c => `<div class="readiness-row"><span class="st ${c.status}">${c.status.toUpperCase()}</span>
+            <div><div>${esc(c.check)}</div><div class="why">${esc(c.reason)}</div></div></div>`).join('') +
+            (reportData.golden_test ? `<p class="meter-desc">Golden test list: <b>${reportData.golden_test.images}</b> images / ${reportData.golden_test.boxes} boxes in <code>${esc(reportData.golden_test.file)}</code></p>`
+                : '<p class="meter-desc">Create a golden test list with <code>--golden-split 0.15</code> (stratified by camera × class × day/night, diverse images, near-duplicates kept together).</p>');
+
+        const pc = Object.entries(d.per_class || {});
+        const classBoxes = barsHtml(pc.map(([c, v]) => [c, v.boxes, `${v.images} images`]), null);
+        const classColored = pc.map(([c, v]) => barsHtml([[c, v.boxes, `${v.images} images`]], classColors[c])).join('');
+        const dayNight = pc.map(([c, v]) => `<tr><td>${esc(c)}</td><td>${v.day}</td><td>${v.night}</td><td>${v.unknown || 0}</td></tr>`).join('');
+        const sizes = pc.map(([c, v]) => `<tr><td>${esc(c)}</td><td>${v.small}</td><td>${v.medium}</td><td>${v.large}</td><td>${v.diversity ?? 'n/a'}</td></tr>`).join('');
+        const rules = d.rules || {};
+        grid.innerHTML = [
+            distCard('Boxes per class', 'fa-tags', classColored || classBoxes),
+            distCard('Images per camera', 'fa-video', barsHtml(Object.entries(d.per_camera || {}).map(([k, v]) => [k, v.images, `${v.boxes} boxes`]))),
+            distCard('Images per source device', 'fa-microchip', barsHtml(Object.entries(d.per_device || {}).map(([k, v]) => [k, v.images, `${v.boxes} boxes`]))),
+            distCard('Day vs night (images)', 'fa-circle-half-stroke', barsHtml(Object.entries(d.per_period || {}).map(([k, v]) => [k, v.images, `${v.boxes} boxes`])) +
+                `<table class="dist-table"><tr><th>Boxes per class</th><th>day</th><th>night</th><th>unknown</th></tr>${dayNight}</table>
+                 <p class="meter-desc">Day = ${rules.day_hours ? `${rules.day_hours[0]}:00-${rules.day_hours[1]}:00` : '06-18'} from the file-name time; without a time, mean brightness &lt; ${rules.night_brightness ?? 70} = night.</p>`),
+            distCard('Box size (longer side)', 'fa-up-right-and-down-left-from-center', barsHtml(Object.entries(d.box_sizes || {}).map(([k, v]) => [k, v])) +
+                `<table class="dist-table"><tr><th>Class</th><th>small</th><th>medium</th><th>large</th><th>diversity</th></tr>${sizes}</table>
+                 <p class="meter-desc">Small &lt; ${rules.small_px ?? 32}px, large &gt; ${rules.large_px ?? 96}px. Diversity = mean cosine distance between the boxes of a class (higher = more varied; near 0 = near-copies).</p>`),
+            distCard('Backgrounds', 'fa-image', barsHtml([['with boxes', d.images - d.backgrounds], ['backgrounds', d.backgrounds, `${d.background_pct}%`]])),
+        ].join('');
+    }
+
+    function itemById(id) {
+        return reportData.items.find(it => it.id === id);
+    }
+
     // ==========================================================================
-    // ANOMALY OVERRIDES / HUMAN ACTION REGISTER
+    // REVIEW ACTIONS
     // ==========================================================================
-    
+
     function excludeCrop(id, description = "") {
         deletedIds.add(id);
-        registerAction({
-            type: 'exclude_crop',
-            id: id,
-            description: description || `Excluded crop ${id} from dataset.`
-        });
-        
-        // Reset current selection detail if it was deleted
+        keptIds.delete(id);
+        registerAction({ type: 'delete', id, description: description || `Deleted ${id}.` });
         recomputeCuration();
     }
-    
-    function restoreCrop(id) {
-        deletedIds.delete(id);
-        
-        // Remove from actions log
-        const idx = actionsLog.findIndex(act => act.type === 'exclude_crop' && act.id === id);
-        if (idx >= 0) actionsLog.splice(idx, 1);
-        
-        registerAction({
-            type: 'restore_crop',
-            id: id,
-            description: `Restored crop ${id} back to active dataset.`
-        });
-        
-        recomputeCuration();
-    }
-    
+
     function approveCrop(id, description = "") {
         keptIds.add(id);
-        registerAction({
-            type: 'approve_crop',
-            id: id,
-            description: description || `Approved crop ${id} as valid.`
-        });
+        registerAction({ type: 'keep', id, description: description || `Confirmed ${id}.` });
         recomputeCuration();
     }
-    
+
     function relabelCrop(id, oldLabel, newLabel) {
-        relabeledLabels.set(id, newLabel);
-        registerAction({
-            type: 'relabel_crop',
-            id: id,
-            old_label: oldLabel,
-            new_label: newLabel,
-            description: `Relabeled crop ${id} from '${oldLabel}' to '${newLabel}'.`
-        });
+        const item = itemById(id);
+        if (item && newLabel === item.label) relabeledLabels.delete(id);
+        else relabeledLabels.set(id, newLabel);
+        registerAction({ type: 'relabel', id, old_label: oldLabel, new_label: newLabel, description: `Relabeled ${id}: '${oldLabel}' → '${newLabel}'.` });
         recomputeCuration();
     }
-    
-    function registerAction(act) {
-        // Prevent duplicate logs for the same crop and type
-        const existingIdx = actionsLog.findIndex(a => a.id === act.id && a.type === act.type);
-        if (existingIdx >= 0) {
-            actionsLog[existingIdx] = act;
-        } else {
-            actionsLog.push(act);
+
+    function undoCrop(id) {
+        deletedIds.delete(id);
+        relabeledLabels.delete(id);
+        keptIds.delete(id);
+        for (let i = actionsLog.length - 1; i >= 0; i--) {
+            if (actionsLog[i].id === id) actionsLog.splice(i, 1);
         }
+        saveState();
+        recomputeCuration();
     }
-    
+
+    function registerAction(act) {
+        // One entry per crop: the latest decision wins
+        const existingIdx = actionsLog.findIndex(a => a.id === act.id);
+        if (existingIdx >= 0) actionsLog.splice(existingIdx, 1);
+        act.time = new Date().toISOString();
+        actionsLog.push(act);
+        saveState();
+    }
+
     function updateExportBar() {
         const bar = document.querySelector('.export-floating-bar');
-        const summaryText = document.getElementById('export-actions-summary');
-        
+        const pending = deletedIds.size + relabeledLabels.size;
         if (actionsLog.length > 0) {
             bar.style.display = 'block';
-            summaryText.textContent = `${actionsLog.length} curation action(s) ready to export`;
+            document.getElementById('export-actions-summary').textContent =
+                `${deletedIds.size} to delete · ${relabeledLabels.size} to relabel · ${keptIds.size} confirmed`;
+            document.getElementById('btn-commit-writeback').disabled = pending === 0 || !serverAvailable;
         } else {
             bar.style.display = 'none';
         }
     }
-    
+
+    function updateSliderLabels() {
+        document.getElementById('val-dup').textContent = dupThreshold.toFixed(2);
+        document.getElementById('val-lof').textContent = lofThreshold.toFixed(2);
+        document.getElementById('val-mis-conf').textContent = `${Math.round(mislabelConf * 100)}%`;
+    }
+
     // ==========================================================================
     // INTERACTIVE CANVAS PLOT RENDERING
     // ==========================================================================
@@ -1211,7 +862,8 @@
         const z = coords[2] || 0;
         
         if (!is3D) {
-            return [x, y, 0];
+            const m = map2dCoordinates[idx];
+            return m ? [m[0], m[1], 0] : [x, y, 0];
         }
         
         const cosY = Math.cos(rotationY);
@@ -1352,12 +1004,12 @@
                     ctx.globalAlpha = Math.max(0.1, depthFactor * 0.8);
                 }
                 
-                if (item.is_duplicate) {
-                    drawGlowingHalo(sx, sy, 14 * depthFactor, 'rgba(0, 242, 254, 0.25)', 'rgba(0, 242, 254, 0)');
-                } else if (item.is_outlier) {
+                if (item.is_mislabeled) {
+                    drawGlowingHalo(sx, sy, 14 * depthFactor, 'rgba(245, 158, 11, 0.35)', 'rgba(245, 158, 11, 0)');
+                } else if (item.is_outlier || item.has_issue) {
                     drawGlowingHalo(sx, sy, 14 * depthFactor, 'rgba(244, 63, 94, 0.25)', 'rgba(244, 63, 94, 0)');
-                } else if (item.is_mislabeled) {
-                    drawGlowingHalo(sx, sy, 14 * depthFactor, 'rgba(245, 158, 11, 0.25)', 'rgba(245, 158, 11, 0)');
+                } else if (item.is_duplicate) {
+                    drawGlowingHalo(sx, sy, 14 * depthFactor, 'rgba(0, 242, 254, 0.25)', 'rgba(0, 242, 254, 0)');
                 }
                 
                 ctx.restore();
@@ -1367,6 +1019,7 @@
         // Second Draw: Points Core
         renderOrder.forEach(i => {
             const item = items[i];
+            if (item.removed) return; // already deleted from the label files
             const [px, py, pz] = projectedCoords[i];
             const sx = px * viewZoom + viewPanX;
             const sy = py * viewZoom + viewPanY;
@@ -1389,9 +1042,9 @@
             
             if (item.curDeleted) {
                 // Render excluded items as small faded gray crosses
-                ctx.strokeStyle = '#444';
+                ctx.strokeStyle = 'rgba(244, 63, 94, 0.7)';
                 ctx.lineWidth = 1.5;
-                const size = 3 * depthFactor;
+                const size = 4 * depthFactor;
                 ctx.moveTo(sx - size, sy - size);
                 ctx.lineTo(sx + size, sy + size);
                 ctx.moveTo(sx + size, sy - size);
@@ -1431,6 +1084,19 @@
                     ctx.lineWidth = 1;
                     ctx.stroke();
                 }
+                // Review decision mark: green ring = approved, amber square = relabeled
+                if (relabeledLabels.has(item.id)) {
+                    const q = radius + 3;
+                    ctx.strokeStyle = '#f59e0b';
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(sx - q, sy - q, q * 2, q * 2);
+                } else if (item.curKept) {
+                    ctx.beginPath();
+                    ctx.arc(sx, sy, radius + 3, 0, Math.PI * 2);
+                    ctx.strokeStyle = '#10b981';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                }
             }
             
             ctx.restore();
@@ -1443,9 +1109,51 @@
                 const [px, py] = projectedCoords[hoveredIndex];
                 const sx = px * viewZoom + viewPanX;
                 const sy = py * viewZoom + viewPanY;
-                drawTooltip(sx, sy, item);
+                updateHoverPreview(sx, sy, item);
             }
         }
+        if (hoveredIndex < 0 || hoveredIndex >= N || items[hoveredIndex].curDeleted) updateHoverPreview(0, 0, null);
+    }
+
+    function itemFlags(item) {
+        const f = [];
+        if (item.is_mislabeled) f.push(`looks like '${item.pred}' (${pct(item.pred_conf)})`);
+        if (item.is_outlier) f.push(`unusual (LOF ${item.lof.toFixed(2)})`);
+        if (item.has_issue) f.push(...item.issues);
+        if (item.is_duplicate) f.push('near-duplicate');
+        return f;
+    }
+
+    function itemDecision(item) {
+        if (item.curDeleted) return ['To be removed', '#f43f5e'];
+        if (relabeledLabels.has(item.id)) return [`Relabeled ${item.label} → ${item.curLabel}`, '#f59e0b'];
+        if (item.curKept) return ['Approved', '#10b981'];
+        return null;
+    }
+
+    let hoverShownId = null;
+    function updateHoverPreview(sx, sy, item) {
+        const box = document.getElementById('plot-hover');
+        if (!item) { box.classList.add('hidden'); hoverShownId = null; return; }
+        if (hoverShownId !== item.id) {
+            hoverShownId = item.id;
+            const flags = itemFlags(item);
+            const dec = itemDecision(item);
+            box.innerHTML = `<img src="${esc(item.path)}" alt="">
+                <div><b>${esc(item.curLabel)}</b>${item.pred ? ` · model: ${esc(item.pred)} ${pct(item.pred_conf)}` : ''}</div>
+                <div style="word-break:break-all">${esc(item.split)}/${esc(item.image)}</div>
+                ${flags.length ? `<div class="ph-flags">${flags.map(esc).join('<br>')}</div>` : ''}
+                ${dec ? `<div class="ph-decision" style="color:${dec[1]}">${esc(dec[0])}</div>` : ''}
+                <div style="margin-top:4px;opacity:.7">Click to inspect</div>`;
+        }
+        box.classList.remove('hidden');
+        const W = canvas.clientWidth, H = canvas.clientHeight;
+        const bw = box.offsetWidth || 200, bh = box.offsetHeight || 260;
+        let x = sx + 16, y = sy - bh / 2;
+        if (x + bw > W - 8) x = sx - bw - 16;
+        y = Math.max(8, Math.min(H - bh - 8, y));
+        box.style.left = `${Math.max(8, x)}px`;
+        box.style.top = `${y}px`;
     }
     
     function drawGlowingHalo(x, y, r, innerColor, outerColor) {
@@ -1465,9 +1173,10 @@
         const labelText = `Label: ${item.curLabel}`;
         
         let tags = [];
-        if (item.is_duplicate) tags.push("DUPLICATE");
-        if (item.is_outlier) tags.push("OUTLIER");
         if (item.is_mislabeled) tags.push("MISLABELED");
+        if (item.is_outlier) tags.push("UNUSUAL");
+        if (item.has_issue) tags.push("BOX ISSUE");
+        if (item.is_duplicate) tags.push("DUPLICATE");
         
         // Calculate dynamic dimensions
         ctx.font = 'bold 12px var(--font-sans)';
@@ -1508,7 +1217,7 @@
         ctx.font = 'bold 12px var(--font-sans)';
         ctx.fillText(titleText, tx + 10, ty + 18);
         
-        ctx.fillStyle = 'var(--text-secondary)';
+        ctx.fillStyle = '#8b949e';
         ctx.font = '11px var(--font-sans)';
         ctx.fillText(labelText, tx + 10, ty + 32);
         
@@ -1516,10 +1225,11 @@
         if (tags.length > 0) {
             let txOffset = tx + 10;
             tags.forEach(tag => {
-                let badgeColor = 'var(--text-secondary)';
-                if (tag === 'DUPLICATE') badgeColor = 'var(--color-duplicate)';
-                else if (tag === 'OUTLIER') badgeColor = 'var(--color-outlier)';
-                else if (tag === 'MISLABELED') badgeColor = 'var(--color-mislabel)';
+                // Canvas can't resolve CSS variables, so use literal colors
+                let badgeColor = '#8b949e';
+                if (tag === 'DUPLICATE') badgeColor = '#00f2fe';
+                else if (tag === 'UNUSUAL' || tag === 'BOX ISSUE') badgeColor = '#f43f5e';
+                else if (tag === 'MISLABELED') badgeColor = '#f59e0b';
                 
                 ctx.fillStyle = badgeColor;
                 ctx.font = 'bold 9px var(--font-sans)';
@@ -1705,195 +1415,332 @@
             }
             
             if (hoveredIndex >= 0) {
-                // Open Item in Explorer
-                switchTab('explorer');
-                selectExplorerItem(hoveredIndex);
+                selectedIndex = hoveredIndex;
+                openPointModal(hoveredIndex);
+                drawCanvas();
             }
         });
-    }
-    
-    function setupActionButtons() {
-        // Overview link cards
-        document.querySelectorAll('.stat-card.clickable').forEach(card => {
-            card.addEventListener('click', () => {
-                switchTab(card.getAttribute('data-tab-link'));
-            });
+
+        canvas.addEventListener('mouseleave', () => {
+            if (hoveredIndex >= 0 && !isDrawing) { hoveredIndex = -1; drawCanvas(); }
         });
-        
-        // Explorer Panel Action Overrides
-        const btnExpConfirmRelabel = document.getElementById('btn-exp-confirm-relabel');
-        const btnExpCancelRelabel = document.getElementById('btn-exp-cancel-relabel');
-        
-        btnExpConfirmRelabel.onclick = () => {
+
+        document.getElementById('btn-plot-fullscreen').addEventListener('click', togglePlotFullscreen);
+        document.addEventListener('fullscreenchange', () => {
+            if (!document.fullscreenElement) plotCard.classList.remove('plot-fullscreen');
+            syncFullscreenUi();
+        });
+        let resizeTimer = null;
+        window.addEventListener('resize', () => {
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => { if (activeTab === 'overview') resetCanvasView(); }, 80);
+        });
+        setupPointModal();
+    }
+
+    // ==========================================================================
+    // SIMILARITY MAP: FULL SCREEN + POINT INSPECTOR
+    // ==========================================================================
+
+    const plotCard = document.getElementById('plot-card');
+
+    function isPlotFullscreen() {
+        return document.fullscreenElement === plotCard || plotCard.classList.contains('plot-fullscreen');
+    }
+
+    function syncFullscreenUi() {
+        const fs = isPlotFullscreen();
+        document.body.classList.toggle('plot-fs-lock', fs);
+        const btn = document.getElementById('btn-plot-fullscreen');
+        btn.classList.toggle('active', fs);
+        btn.innerHTML = fs ? '<i class="fa-solid fa-compress"></i> Exit full screen' : '<i class="fa-solid fa-expand"></i> Full screen';
+        // Overlays must live inside the fullscreen element to be visible
+        const host = document.fullscreenElement || document.body;
+        const pm = document.getElementById('point-modal');
+        const fm = document.getElementById('frame-modal');
+        if (pm.parentElement !== host) host.appendChild(pm);
+        if (fm.parentElement !== host) host.appendChild(fm);
+        requestAnimationFrame(() => resetCanvasView());
+    }
+
+    function togglePlotFullscreen() {
+        if (isPlotFullscreen()) {
+            plotCard.classList.remove('plot-fullscreen');
+            if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+            syncFullscreenUi();
+            return;
+        }
+        if (activeTab !== 'overview') switchTab('overview');
+        const fallback = () => { plotCard.classList.add('plot-fullscreen'); syncFullscreenUi(); };
+        if (plotCard.requestFullscreen) {
+            plotCard.requestFullscreen().catch(fallback);  // fullscreenchange syncs the UI on success
+        } else {
+            fallback();
+        }
+    }
+
+    let pointModalIdx = -1;
+
+    function setupPointModal() {
+        const modal = document.getElementById('point-modal');
+        modal.addEventListener('click', e => { if (e.target === modal) closePointModal(); });
+        document.getElementById('pm-close').onclick = closePointModal;
+        const cur = () => reportData && reportData.items[pointModalIdx];
+        document.getElementById('pm-approve').onclick = () => {
+            const it = cur(); if (!it) return;
+            if (it.curDeleted) deletedIds.delete(it.id);
+            approveCrop(it.id, `Confirmed '${it.curLabel}' from the similarity map.`);
+            refreshPointModal();
+        };
+        document.getElementById('pm-remove').onclick = () => {
+            const it = cur(); if (!it) return;
+            excludeCrop(it.id, 'Deleted box from the similarity map.');
+            refreshPointModal();
+        };
+        document.getElementById('pm-relabel-btn').onclick = () => {
+            const it = cur(); if (!it) return;
+            const nl = document.getElementById('pm-relabel').value;
+            if (nl && nl !== it.curLabel) relabelCrop(it.id, it.curLabel, nl);
+            refreshPointModal();
+        };
+        document.getElementById('pm-undo').onclick = () => {
+            const it = cur(); if (!it) return;
+            undoCrop(it.id);
+            refreshPointModal();
+        };
+        document.getElementById('pm-editor').onclick = () => {
+            const it = cur(); if (!it) return;
+            if (!serverAvailable || !window.CleanCropEditor) { alert('The box editor needs the CleanCrop server. Start the dashboard with CleanCrop.bat.'); return; }
+            closePointModal();
+            if (isPlotFullscreen()) togglePlotFullscreen();  // the editor overlay lives outside the plot card
+            window.CleanCropEditor.open(it.id);
+        };
+    }
+
+    function openPointModal(idx) {
+        const it = reportData.items[idx];
+        if (!it) return;
+        pointModalIdx = idx;
+        updateHoverPreview(0, 0, null);
+        const host = document.fullscreenElement || document.body;
+        const modal = document.getElementById('point-modal');
+        if (modal.parentElement !== host) host.appendChild(modal);
+        document.getElementById('pm-img').src = serverAvailable ? `/api/frame?id=${encodeURIComponent(it.id)}&t=${Date.now()}` : it.path;
+        document.getElementById('pm-crop').src = it.path;
+        refreshPointModal();
+        modal.classList.remove('hidden');
+    }
+
+    function refreshPointModal() {
+        const it = reportData && reportData.items[pointModalIdx];
+        if (!it) return;
+        const flags = itemFlags(it);
+        const dec = itemDecision(it);
+        document.getElementById('point-modal-title').textContent = `${it.split}/${it.image} · box line ${it.line + 1}`;
+        document.getElementById('pm-info').innerHTML = `
+            <div>Label: ${pill(it.curLabel)}${relabeledLabels.has(it.id) ? ` (was ${esc(it.label)})` : ''}</div>
+            <div>Model thinks: <b>${esc(it.pred || 'n/a')}</b> ${it.pred ? pct(it.pred_conf) : ''} · confidence in label: ${pct(it.given_conf)}</div>
+            <div>Unusual score (LOF): <b>${it.lof.toFixed(2)}</b></div>
+            ${flags.length ? `<div style="color:var(--color-mislabel)">${flags.map(esc).join('<br>')}</div>` : '<div>No flags</div>'}
+            <div>Decision: <b style="color:${dec ? dec[1] : 'inherit'}">${dec ? esc(dec[0]) : 'none yet'}</b>${serverAvailable ? '' : ' (not saved: no server)'}</div>`;
+        document.getElementById('pm-relabel').innerHTML = classOptions(it.curLabel);
+        document.getElementById('pm-undo').disabled = !dec;
+        document.getElementById('pm-editor').disabled = !!it.removed;
+    }
+
+    function closePointModal() {
+        document.getElementById('point-modal').classList.add('hidden');
+        pointModalIdx = -1;
+    }
+
+    // ==========================================================================
+    // CONTROLS
+    // ==========================================================================
+
+    function setupSliders() {
+        const bind = (id, setter) => {
+            document.getElementById(id).addEventListener('input', e => {
+                setter(parseFloat(e.target.value));
+                updateSliderLabels();
+                misCursor = -1;
+                recomputeCuration();
+                saveState();
+            });
+        };
+        bind('slider-dup', v => { dupThreshold = v; });
+        bind('slider-lof', v => { lofThreshold = v; });
+        bind('slider-mis-conf', v => { mislabelConf = v; });
+    }
+
+    function setupActionButtons() {
+        document.querySelectorAll('.stat-card.clickable').forEach(card => {
+            card.addEventListener('click', () => switchTab(card.getAttribute('data-tab-link')));
+        });
+
+        document.getElementById('btn-exp-confirm-relabel').onclick = () => {
             const item = reportData.items[selectedIndex];
             if (!item) return;
-            const newLabel = document.getElementById('exp-relabel-select').value;
-            relabelCrop(item.id, item.curLabel, newLabel);
+            relabelCrop(item.id, item.curLabel, document.getElementById('exp-relabel-select').value);
+        };
+        document.getElementById('btn-exp-cancel-relabel').onclick = () => {
             document.getElementById('relabel-dropdown-container').classList.add('hidden');
         };
-        
-        btnExpCancelRelabel.onclick = () => {
-            document.getElementById('relabel-dropdown-container').classList.add('hidden');
+        document.getElementById('btn-exp-frame').onclick = () => {
+            const item = reportData.items[selectedIndex];
+            if (item) openFrame(item.id);
         };
-        
-        // Export Action Button handler
+
         document.getElementById('btn-export-actions').addEventListener('click', exportCurationReport);
         document.getElementById('btn-commit-writeback').addEventListener('click', commitWriteback);
+
+        ['explorer-search', 'filter-class', 'filter-split', 'filter-anomaly', 'sort-by'].forEach(id => {
+            document.getElementById(id).addEventListener(id === 'explorer-search' ? 'input' : 'change', () => {
+                shown.explorer = 300;
+                renderExplorerTab();
+            });
+        });
     }
-    
-    // --- FILE UPLOAD ENGINE ---
-    function handleFileUpload(e) {
-        const file = e.target.files[0];
-        if (!file) return;
-        
-        const reader = new FileReader();
-        reader.onload = function(evt) {
-            try {
-                const report = JSON.parse(evt.target.result);
-                if (!report.items || !report.summary) {
-                    alert("Invalid report format! Curation report must contain 'items' list and 'summary' details.");
-                    return;
-                }
-                loadDataset(report);
-                alert("Dataset curation report successfully loaded!");
-            } catch(err) {
-                alert("Error parsing file! Please upload a valid JSON curation report: " + err.message);
+
+    // Full-frame viewer: click any crop image to see the whole image with all its boxes
+    function setupFrameViewer() {
+        document.addEventListener('click', e => {
+            const img = e.target.closest('img[data-frame]');
+            if (img && img.dataset.frame) {
+                e.stopPropagation();
+                openFrame(img.dataset.frame);
             }
-        };
-        reader.readAsText(file);
+        }, true);
+        document.getElementById('frame-modal').addEventListener('click', closeFrame);
     }
-    
-    // --- FILE EXPORT ENGINE (Human-in-the-loop audit file) ---
+
+    function openFrame(id) {
+        const item = itemById(id);
+        if (!item) return;
+        if (!serverAvailable) {
+            alert('The full-frame view needs the CleanCrop server. Start the dashboard with CleanCrop.bat.');
+            return;
+        }
+        document.getElementById('frame-img').src = `/api/frame?id=${encodeURIComponent(id)}&t=${Date.now()}`;
+        document.getElementById('frame-caption').textContent =
+            `${item.split}/${item.image} — highlighted box: '${item.curLabel}' (line ${item.line + 1}). Other boxes in this image are outlined thinly. Click or press Esc to close.`;
+        document.getElementById('frame-modal').classList.remove('hidden');
+    }
+
+    function closeFrame() {
+        document.getElementById('frame-modal').classList.add('hidden');
+    }
+
+    function setupKeyboard() {
+        document.addEventListener('keydown', e => {
+            if (e.target instanceof Element && e.target.matches('input, select, textarea')) return;
+            const modalOpen = !document.getElementById('frame-modal').classList.contains('hidden');
+            const pointOpen = !document.getElementById('point-modal').classList.contains('hidden');
+            if (e.key === 'Escape') {
+                if (modalOpen) closeFrame();
+                else if (pointOpen) closePointModal();
+                else if (isPlotFullscreen()) togglePlotFullscreen();
+                return;
+            }
+            if (activeTab === 'overview' && !modalOpen && !pointOpen && e.key.toLowerCase() === 'f' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                togglePlotFullscreen();
+                e.preventDefault();
+                return;
+            }
+            if (activeTab !== 'mislabels' || misCursor < 0) return;
+            const it = mislabelList[misCursor];
+            if (!it) return;
+            const key = e.key.toLowerCase();
+            if (key === 'e') return;  // edit boxes: handled by editor.js
+            if (key === 'r') relabelCrop(it.id, it.curLabel, it.pred);
+            else if (key === 'k') approveCrop(it.id, `Confirmed label '${it.curLabel}'.`);
+            else if (key === 'x' || e.key === 'Delete') excludeCrop(it.id, 'Deleted suspected mislabeled box.');
+            else if (key === 'f') { modalOpen ? closeFrame() : openFrame(it.id); e.preventDefault(); return; }
+            else if (key === 'd' || e.key === 'ArrowDown' || key === 'j') selectMislabelItem(Math.min(misCursor + 1, Math.min(mislabelList.length, shown.mislabels) - 1));
+            else if (key === 'a' || e.key === 'ArrowUp') selectMislabelItem(Math.max(misCursor - 1, 0));
+            else return;
+            closeFrame();
+            e.preventDefault();
+        });
+    }
+
+    // --- Audit file export ---
     function exportCurationReport() {
         if (!reportData) return;
-        
-        // Construct final curated items list
-        const curatedItems = reportData.items.map(item => {
-            const hasRelabel = relabeledLabels.has(item.id);
-            const hasDelete = deletedIds.has(item.id);
-            
-            return {
-                id: item.id,
-                original_label: item.label,
-                curated_label: hasDelete ? null : (hasRelabel ? relabeledLabels.get(item.id) : item.label),
-                status: hasDelete ? "excluded" : (hasRelabel ? "relabeled" : "retained"),
-                is_outlier: item.is_outlier,
-                is_duplicate: item.is_duplicate,
-                is_mislabeled: item.is_mislabeled
-            };
-        });
-        
         const auditLog = {
             export_timestamp: new Date().toISOString(),
-            dataset_summary: {
-                original_samples: reportData.items.length,
-                curated_samples: reportData.items.length - deletedIds.size,
-                excluded_count: deletedIds.size,
-                relabeled_count: relabeledLabels.size,
-                approved_anomaly_overrides: keptIds.size
+            dataset: reportData.dataset_dir,
+            summary: {
+                boxes: reportData.items.filter(it => !it.removed).length,
+                to_delete: deletedIds.size,
+                to_relabel: relabeledLabels.size,
+                confirmed_correct: keptIds.size,
             },
-            actions_executed: actionsLog,
-            curated_dataset: curatedItems
+            actions: actionsLog,
         };
-        
-        // Download File trigger
-        const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(auditLog, null, 2));
-        const dlAnchorElem = document.createElement('a');
-        dlAnchorElem.setAttribute("href",     dataStr     );
-        dlAnchorElem.setAttribute("download", `curated_dataset_actions_${Date.now()}.json`);
-        dlAnchorElem.click();
-        
-        // Clear log state after successful export
-        alert("Curation log exported successfully!");
+        const blob = new Blob([JSON.stringify(auditLog, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `cleancrop_review_${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(a.href);
     }
-    
+
+    // --- Write decisions into the YOLO label files ---
     function commitWriteback() {
         if (!reportData) return;
-        
         if (deletedIds.size === 0 && relabeledLabels.size === 0) {
-            alert("No actions to commit! Please exclude or relabel some crops first.");
+            alert("Nothing to save yet: delete or relabel some boxes first.");
             return;
         }
-        
-        if (!confirm(`Are you sure you want to commit ${deletedIds.size} deletion(s) and ${relabeledLabels.size} relabeling(s) directly to the dataset files? This will overwrite your raw YOLO label files.`)) {
-            return;
-        }
-        
+        const msg = `Save to the dataset label files?\n\n` +
+            `• Delete ${deletedIds.size} box(es)\n• Relabel ${relabeledLabels.size} box(es)\n\n` +
+            `Dataset: ${reportData.dataset_dir}\n` +
+            `A backup of every changed label file is kept in the curation output folder (label_backups).`;
+        if (!confirm(msg)) return;
+
         const actions = [];
-        
-        // Excluded crops
         deletedIds.forEach(id => {
-            const item = reportData.items.find(it => it.id === id);
-            if (item && item.original_image_path) {
-                actions.push({
-                    original_image_path: item.original_image_path,
-                    crop_idx: item.crop_idx,
-                    bbox_norm: item.bbox_norm,
-                    action: 'DELETE'
-                });
-            }
+            const item = itemById(id);
+            if (item && !item.removed) actions.push({ id, action: 'DELETE' });
         });
-        
-        // Relabeled crops
         relabeledLabels.forEach((newLabel, id) => {
-            const item = reportData.items.find(it => it.id === id);
-            if (item && item.original_image_path) {
-                actions.push({
-                    original_image_path: item.original_image_path,
-                    crop_idx: item.crop_idx,
-                    bbox_norm: item.bbox_norm,
-                    action: 'RELABEL',
-                    new_class_id: newLabel
-                });
-            }
+            if (deletedIds.has(id)) return;
+            const classId = classNames.indexOf(newLabel);
+            if (classId < 0) return;
+            actions.push({ id, action: 'RELABEL', new_class_id: classId });
         });
-        
-        // Make POST request to /api/writeback
+
+        const btn = document.getElementById('btn-commit-writeback');
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving...';
+
         fetch('/api/writeback', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ actions: actions })
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ actions }),
         })
-        .then(response => {
-            if (!response.ok) {
-                throw new Error(`Server returned status ${response.status}`);
-            }
-            return response.json();
-        })
-        .then(data => {
-            if (data.status === 'success') {
-                alert(`Success! ${data.message}`);
-                // Clear the curation state after successful writeback
-                deletedIds.clear();
-                relabeledLabels.clear();
-                actionsLog.length = 0;
-                recomputeCuration();
-            } else {
-                alert(`Error during writeback: ${data.message}`);
-            }
-        })
-        .catch(error => {
-            console.error('Writeback failed:', error);
-            alert(`Writeback failed! Make sure the CleanCrop server is running and try again. Error: ${error.message}`);
-        });
+            .then(r => r.json())
+            .then(data => {
+                let text = data.message || 'Done.';
+                if (data.backup_dir) text += `\n\nBackup of the original label files:\n${data.backup_dir}`;
+                if (data.errors && data.errors.length) text += `\n\nProblems:\n- ${data.errors.slice(0, 10).join('\n- ')}`;
+                alert(text);
+                if (data.status !== 'error') location.reload();
+            })
+            .catch(err => alert(`Saving failed. Is the CleanCrop window still open?\n${err.message}`))
+            .finally(() => {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> Save Changes to Dataset';
+            });
     }
-    
+
     function showErrorState(msg) {
         document.querySelector('.content-scroll').innerHTML = `
-            <div class="empty-state-msg" style="height: 400px; grid-column: 1/-1;">
-                <i class="fa-solid fa-triangle-exclamation" style="font-size:48px; color:var(--color-outlier);"></i>
-                <h2>Curation Environment Error</h2>
-                <p>${msg}</p>
-            </div>
-        `;
+            <div class="empty-state-msg" style="height:400px;grid-column:1/-1;">
+                <i class="fa-solid fa-triangle-exclamation" style="font-size:48px;color:var(--color-outlier);"></i>
+                <h2>Nothing to show</h2>
+                <p>${esc(msg)}</p>
+            </div>`;
     }
-    
-    // --- EXPLORER FILTER TRIGGERS ---
-    document.getElementById('explorer-search').addEventListener('input', renderExplorerTab);
-    document.getElementById('filter-class').addEventListener('change', renderExplorerTab);
-    document.getElementById('filter-anomaly').addEventListener('change', renderExplorerTab);
-    document.getElementById('sort-by').addEventListener('change', renderExplorerTab);
 
 })();

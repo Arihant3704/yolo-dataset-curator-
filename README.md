@@ -1,232 +1,140 @@
-# CleanCrop — YOLO Dataset Quality & Curation Dashboard
+# CleanCrop — find and fix bad labels in a YOLO dataset
 
-> Visual YOLO dataset curation powered by DINOv2/CLIP embeddings — detect near-duplicates, outliers & mislabels before training, then write corrections directly back to your label files.
-
-![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-green)
-![Framework](https://img.shields.io/badge/Embeddings-DINOv2%20%7C%20CLIP-orange)
-![Dashboard](https://img.shields.io/badge/Dashboard-Vanilla%20JS%20%7C%20Canvas-purple)
-
----
-<img width="1829" height="956" alt="image" src="https://github.com/user-attachments/assets/76f5b077-2ed1-4ab9-946c-3d9330a43621" />
-
-## What is CleanCrop?
-
-Training on dirty data silently degrades model accuracy. CleanCrop is an **end-to-end pipeline** that:
-1. Extracts individual object crops from YOLO bounding box annotations
-2. Embeds them using **DINOv2** or **CLIP** vision models
-3. Detects **near-duplicates**, **class outliers**, and **suspected mislabels** using unsupervised algorithms
-4. Presents everything in an **interactive 2D/3D web dashboard** for human-in-the-loop review
-5. Writes approved corrections **directly back to the source `.txt` label files**
+If your detector "learns the wrong things", the cause is often in the labels:
+boxes with the wrong class, boxes around background or other objects, the same
+object boxed twice, or the same frames in both train and val.
+CleanCrop finds these automatically and lets you fix them in a browser.
 
 ---
 
-## Pipeline Architecture
+## Quick start (Windows)
 
-```mermaid
-graph TD
-    A[YOLO Dataset + data.yaml] --> B[dataset_curator_yolo.py]
-    B --> C[Bounding Box Crop Extractor]
-    C --> D[DINOv2 / CLIP Feature Extractor]
-    D --> E[768-D Embedding Matrix]
-    E --> F1[Cosine Similarity → Near-Duplicates]
-    E --> F2[Local Outlier Factor → Class Outliers]
-    E --> F3[KNN Consensus → Mislabels]
-    F1 & F2 & F3 --> G[curation_report.js]
-    G --> H[Interactive Dashboard]
-    H --> I[POST /api/writeback]
-    I --> J[Patched YOLO .txt Label Files]
-```
+1. **Double-click `CleanCrop.bat`** (or drag your dataset folder onto it).
+   The first run installs everything it needs (a few minutes).
+2. Paste the path of your dataset folder — the one containing `data.yaml`.
+3. Wait for the analysis (first run on CPU: roughly 2 boxes/second; later runs reuse the cache).
+4. The dashboard opens in your browser. Review the flagged boxes.
+5. Press **Save Changes to Dataset**. The label `.txt` files are updated and a
+   backup of every changed file is kept in `curation_output/<dataset>/label_backups/`.
+6. Retrain.
 
----
+Keep the black CleanCrop window open while you review; closing it stops the dashboard.
+Your review decisions are auto-saved, so you can close the browser and continue later
+(run `CleanCrop.bat` again and choose **[1] Continue reviewing**).
 
-<img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/9623f663-7d20-4365-a6e3-a8408ccdb7a5" />
-
-
-## Key Features
-
-| Feature | Detail |
-|---|---|
-| **Deep Embeddings** | DINOv2 (`facebook/dinov2-base`) or CLIP (`openai/clip-vit-base-patch32`) |
-| **Near-Duplicate Detection** | All-pairs cosine similarity with configurable threshold |
-| **Outlier Detection** | Class-wise Local Outlier Factor (LOF) scoring |
-| **Mislabel Detection** | KNN majority-class consensus voting |
-| **2D/3D PCA Explorer** | Browser-side SVD projection — pan, zoom, rotate |
-| **3D Depth Rendering** | Painter's Algorithm + depth-cueing (opacity & point size) |
-| **Real-time Threshold Tuning** | Sliders recompute all metrics live in the browser |
-| **Label Writeback API** | `POST /api/writeback` patches source label files directly |
-| **Zero Dependencies (frontend)** | Pure HTML + Vanilla JS + CSS — no npm, no build step |
+> Tip: work on a copy of your dataset, or commit it to git, so you can always compare.
 
 ---
 
-## Repository Structure
+## What it checks
 
-```
-yolo-dataset-curator/
-├── dataset_curator_yolo.py   # Full pipeline: crop → embed → detect → serve API
-├── index.html                # Dashboard UI layout
-├── styles.css                # Dark-mode glassmorphic styling
-├── app.js                    # PCA engine, 3D renderer, curation state, writeback fetch
-├── requirements.txt          # Python dependencies
-└── road_traffic_curated/     # Example output (generated, not committed)
-    ├── demo_dataset/
-    │   ├── crops/            # Extracted crop images
-    │   └── curation_report.js
-    ├── index.html
-    ├── app.js
-    └── styles.css
-```
-
----
-
-## Installation
-
-```bash
-git clone https://github.com/Arihant3704/yolo-dataset-curator-.git
-cd yolo-dataset-curator-
-pip install -r requirements.txt
-```
-
-**Requirements:** Python 3.8+, PyTorch, a CUDA GPU is recommended for large datasets.
-
----
-
-## Usage
-
-### Full pipeline — crop, embed, detect, then launch dashboard
-
-```bash
-python dataset_curator_yolo.py \
-    --dataset-dir /path/to/your/yolo_dataset \
-    --output-dir curation_output \
-    --model dinov2 \
-    --dup-threshold 0.95 \
-    --lof-threshold 1.3 \
-    --serve \
-    --port 8000
-```
-
-Then open: **http://localhost:8000/index.html**
-
-### Dashboard only — view a pre-computed report without re-running inference
-
-```bash
-python dataset_curator_yolo.py \
-    --dataset-dir /path/to/your/yolo_dataset \
-    --output-dir curation_output \
-    --serve-only \
-    --port 8000
-```
-
-### CLI Argument Reference
-
-| Argument | Default | Description |
+| Tab | What it finds | How |
 |---|---|---|
-| `--dataset-dir` | `auto/road_traffic` | Path to YOLO dataset folder containing `data.yaml` |
-| `--output-dir` | `road_traffic_curated` | Output directory for crops, JSON report, and dashboard |
-| `--model` | `dinov2` | Feature extractor: `dinov2` or `clip` |
-| `--dup-threshold` | `0.95` | Cosine similarity cutoff for near-duplicate flagging |
-| `--lof-threshold` | `1.3` | LOF score threshold for outlier flagging |
-| `--knn-k` | `5` | K for KNN mislabel consensus |
-| `--batch-size` | `32` | Embedding extraction batch size |
-| `--serve` | `false` | Launch dashboard after full pipeline run |
-| `--serve-only` | `false` | Launch dashboard for existing output (no inference) |
-| `--port` | `8000` | HTTP server port |
+| **1. Suspected Mislabels** | Boxes whose class looks wrong (e.g. a *dog* labelled *pigeon*) | A classifier trained on the *other* folds of the data predicts every box; confident disagreement with the label is flagged. Similar boxes are shown as evidence. |
+| **2. Unusual Boxes** | Boxes that don't look like the rest of their class — other species, empty background, bad crops | Local Outlier Factor inside each class |
+| **3. Broken / Double Boxes** | Same object boxed twice, two classes on one object, boxes outside the image, class ids not in `data.yaml` | Read directly from the label files |
+| **4. Near-Duplicates** | Almost identical boxes in different images — train↔val leaks listed first | Cosine similarity of embeddings |
+| **All Boxes** | Browse/search/filter everything | — |
+| **Backgrounds** | Images with no boxes (empty/missing label file), with count and % of images | Read from the label files |
+| **Distribution** | Boxes/images per class, per camera (`nvr-1_NN`) and source device (part before `_nvr`), day vs night, box sizes, per-class diversity, and a golden-test readiness checklist (pass/warn/fail) | File names `<device>_nvr-1_NN_YYYYMMDD_HHMMSS_*.jpg` (day = 06-18 h; no timestamp: brightness < 70 = night); small < 32 px, large > 96 px; diversity = mean cosine distance of embeddings |
+
+Every crop is shown with surrounding context and the box outline. **Click any crop to see the
+full image** with all of its boxes drawn — essential for small objects.
+
+### Similarity map (Overview)
+Hover a point to preview the crop, label, model guess and flags. Click it to open the full image with the box
+drawn and **Approve / Remove / Relabel / Open in editor** (saved like the other tabs). Points with a decision are
+marked (green ring = approved, amber square = relabeled, red cross = removed). **Full screen** button or `F`
+(Esc to leave) works in 2D and 3D.
+
+### Keyboard review (Suspected Mislabels tab)
+`R` accept suggested class · `K` label is correct · `D` delete box · `F` full image · `↑`/`↓` move.
+
+### Sensitivity sliders
+Lower values flag more boxes. Start with the defaults; lower them once the obvious cases are fixed.
 
 ---
 
-## Dashboard Guide
+## Supported dataset layouts
 
-### Tabs
-- **Overview** — Dataset health score, summary stats, interactive PCA plot
-- **Near-Duplicates** — Side-by-side crop pairs ranked by similarity score
-- **Outliers** — LOF-flagged crops displayed with their density scores
-- **Mislabels** — KNN-flagged crops with suggested correct class
-- **Data Explorer** — Full grid of all crops with search, filter, and sort
+```
+dataset/                         dataset/
+├── data.yaml (or classes.txt)   ├── data.yaml
+├── images/                      ├── train/
+│   ├── train/  *.jpg            │   ├── images/
+│   └── val/                     │   └── labels/
+└── labels/                      └── valid/ ...
+    ├── train/  *.txt
+    └── val/
+```
 
-### PCA Plot Controls
-- **2D mode** — Scroll to zoom, drag to pan, click to inspect
-- **3D mode** — Toggle the "3D Mode" button, then drag to rotate
-- **Reset View** — Double-click the canvas
-
-### Curation Actions
-1. Select a crop in any tab
-2. Click **Exclude Crop** (removes from dataset) or **Relabel** (changes class)
-3. The floating bar shows pending action count
-4. Click **Export Curation File (.json)** for a human-readable audit log
-5. Click **Commit to Dataset (Writeback)** to apply changes to source `.txt` label files
-
-> ⚠️ Writeback directly overwrites your source YOLO label files. Back up your dataset before committing.
+Each `.txt` line: `class_id x_center y_center width height` (normalized 0–1).
 
 ---
 
-## YOLO Dataset Format
+## Command line
 
-CleanCrop expects the standard YOLO directory layout:
-
-```
-dataset/
-├── data.yaml
-├── train/
-│   ├── images/   *.jpg / *.png
-│   └── labels/   *.txt
-├── valid/
-│   ├── images/
-│   └── labels/
-└── test/
-    ├── images/
-    └── labels/
+```bash
+python dataset_curator_yolo.py C:\path\to\dataset            # analyse + open dashboard
+python dataset_curator_yolo.py C:\path\to\dataset --serve-only   # reopen dashboard, keep review progress
 ```
 
-Each `*.txt` label file: `class_id x_center y_center width height` (normalized 0–1).
+| Option | Default | Description |
+|---|---|---|
+| `--output-dir` | `curation_output/<dataset name>` | Where crops, cache, reports and backups go |
+| `--model` | `dinov2` | Embedding model: `dinov2` or `clip` |
+| `--mislabel-conf` | `0.7` | Initial mislabel confidence slider |
+| `--lof-threshold` | `1.5` | Initial unusual-box slider |
+| `--dup-threshold` | `0.97` | Initial duplicate slider |
+| `--golden-split FRAC` | off | Also write `golden_test.txt` (image paths): ~FRAC of the images, stratified by camera × class × day/night, preferring images far apart in embedding space; near-duplicates of a chosen image go with it |
+| `--no-serve` / `--no-browser` | | Only analyse / don't open the browser |
+| `--no-cache` | | Recompute all embeddings |
+| `--export-labeling` | | Copy flagged images + labels (YOLO `.txt` and X-AnyLabeling `.json`) into `for_labeling/` (menu option 4) |
+| `--sync-labels` | | Copy labels fixed in `for_labeling/` back into the dataset, with backups (menu option 5) |
+| `--export-folder` | | Save every flagged box as an annotated full image in `to_verify/` (also menu option 3 in `CleanCrop.bat`) |
+| `--port` | `8000` | Next free port is used if busy |
 
----
+Outputs in the output folder:
+- `curation_report.csv` — every box with its flags, most suspicious first (open in Excel)
+- `curation_report.json` — full analysis used by the dashboard
+- `label_backups/<timestamp>/` — original versions of label files you changed
+- `cache/` — embedding cache (delete to force a full recompute)
 
-## How the Writeback API Works
-
-The embedded HTTP server exposes a single API endpoint:
-
-```
-POST /api/writeback
-Content-Type: application/json
-
-{
-  "actions": [
-    {
-      "original_image_path": "/abs/path/to/image.jpg",
-      "crop_idx": 2,
-      "bbox_norm": [0.512, 0.341, 0.128, 0.096],
-      "action": "DELETE"
-    },
-    {
-      "original_image_path": "/abs/path/to/image2.jpg",
-      "crop_idx": 0,
-      "bbox_norm": [0.231, 0.510, 0.200, 0.150],
-      "action": "RELABEL",
-      "new_class_id": "car"
-    }
-  ]
-}
-```
-
-The server matches each action to its annotation line using `crop_idx` first, with a bounding-box coordinate fallback (tolerance `< 0.05`), then rewrites the label file.
-
----
-
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Embedding Models | `transformers` (HuggingFace) — DINOv2, CLIP |
-| Anomaly Detection | `scikit-learn` — LOF, cosine similarity, KNN |
-| Image Processing | `Pillow`, `numpy` |
-| HTTP Server | Python `http.server` (zero extra dependencies) |
-| Frontend | Vanilla HTML5 / CSS3 / JavaScript (Canvas 2D API) |
-| PCA Solver | Custom SVD implemented in JavaScript |
-| 3D Renderer | Painter's Algorithm on `<canvas>` with depth-cueing |
+The dashboard server only listens on `localhost`.
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE).
+
+## Use from Claude (MCP)
+
+`mcp_server.py` is a stdio MCP server that lets Claude run the analysis and review results.
+Install the SDK: `pip install "mcp>=1.2"` (also in requirements.txt).
+
+Tools: `run_analysis` (background job) / `job_status`, `get_summary`, `list_flagged` (mislabel | outlier | duplicate | issue),
+`get_item`, `decide` (approve / exclude / relabel into `review_state.json`, shown by the dashboard),
+`relabel_box` / `remove_box` (edit the YOLO label file, backup in `curation_output/<name>/label_backups`),
+`export_for_labeling`, `sync_labels`, `get_distribution`, `open_dashboard`. All paths are absolute.
+
+**Claude Code** (add `--scope user` to make it available in every project):
+
+```
+claude mcp add --scope user curator -- python "C:\path\to\yolo-dataset-curator--main\mcp_server.py"
+```
+
+**Claude Desktop** (`%APPDATA%\Claude\claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "curator": {
+      "command": "python",
+      "args": ["C:\path\to\yolo-dataset-curator--main\mcp_server.py"]
+    }
+  }
+}
+```
+
+Tip: reload the dashboard after `decide`, otherwise its next auto-save overwrites the decisions.
